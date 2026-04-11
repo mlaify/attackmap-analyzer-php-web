@@ -79,13 +79,18 @@ class PhpWebAnalyzer:
         if not root.exists() or not root.is_dir():
             return False
 
-        if (root / "composer.json").exists():
-            return True
+        composer_signal = (root / "composer.json").exists()
+        php_files = list(root.rglob("*.php"))
+        if not php_files:
+            return False
 
-        if any((root / directory).is_dir() for directory in ("src", "app", "module", "public", "config")):
-            return True
+        structure_signal = any((root / directory).exists() for directory in ("src", "app", "module", "public"))
 
-        return any(root.rglob("*.php"))
+        if composer_signal and structure_signal:
+            return True
+        if composer_signal and len(php_files) >= 2:
+            return True
+        return structure_signal and len(php_files) >= 3
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()

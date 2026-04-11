@@ -24,6 +24,9 @@ dev = [
   "pytest>=8.0.0",
 ]
 
+[project.entry-points."attackmap.analyzers"]
+php_web = "attackmap_analyzer_php_web:PhpWebAnalyzer"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

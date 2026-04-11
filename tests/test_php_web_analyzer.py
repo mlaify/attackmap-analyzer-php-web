@@ -27,10 +27,28 @@ def test_detect_identifies_php_web_project() -> None:
     assert analyzer.detect(FIXTURES / "php_web_app") is True
 
 
-def test_detect_rejects_non_web_php_library() -> None:
+def test_detect_identifies_minimal_php_repository() -> None:
     analyzer = PhpWebAnalyzer()
 
-    assert analyzer.detect(FIXTURES / "php_non_web_lib") is False
+    assert analyzer.detect(FIXTURES / "php_minimal_repo") is True
+
+
+def test_detect_identifies_composer_based_php_repository() -> None:
+    analyzer = PhpWebAnalyzer()
+
+    assert analyzer.detect(FIXTURES / "php_composer_repo") is True
+
+
+def test_detect_identifies_php_repository_with_common_directories() -> None:
+    analyzer = PhpWebAnalyzer()
+
+    assert analyzer.detect(FIXTURES / "php_common_dirs_repo") is True
+
+
+def test_detect_identifies_php_library_repository() -> None:
+    analyzer = PhpWebAnalyzer()
+
+    assert analyzer.detect(FIXTURES / "php_non_web_lib") is True
 
 
 def test_analyze_extracts_routes_and_http_calls() -> None:
