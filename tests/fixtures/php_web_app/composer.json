@@ -1,0 +1,10 @@
+{
+  "name": "example/php-web-app",
+  "require": {
+    "php": "^8.1",
+    "slim/slim": "^4.0",
+    "guzzlehttp/guzzle": "^7.0",
+    "doctrine/orm": "^2.0",
+    "firebase/php-jwt": "^6.0"
+  }
+}
