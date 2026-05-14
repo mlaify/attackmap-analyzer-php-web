@@ -1,6 +1,6 @@
 # attackmap-analyzer-php-web
 
-Broad PHP web analyzer for [AttackMap](https://gitlab.com/matthewd.xyzAI/attackmap).
+Broad PHP web analyzer for [AttackMap](https://github.com/mlaify/AttackMap).
 
 This repository is intentionally separate from AttackMap core. It focuses only on extracting structured signals from PHP repositories:
 
@@ -79,7 +79,7 @@ AttackMap core can discover this analyzer later via one of these options:
 
 1. entry points (preferred long-term)
 2. explicit configured analyzer list
-3. namespace/package scanning in `matthewd.xyzAI/attackmap-analyzers`
+3. namespace/package scanning in `github.com/mlaify`
 
 This repository does not implement core-side discovery logic.
 
