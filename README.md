@@ -1,5 +1,10 @@
 # attackmap-analyzer-php-web
 
+> [!NOTE]
+> **Development is paused.** This project is not under active development.
+> The code remains available for reference, and security reports are still
+> welcome at [security@mlaify.io](mailto:security@mlaify.io).
+
 Broad PHP web analyzer for [AttackMap](https://github.com/mlaify/AttackMap).
 
 This repository is intentionally separate from AttackMap core. It focuses only on extracting structured signals from PHP repositories:
