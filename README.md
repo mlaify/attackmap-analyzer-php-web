@@ -59,7 +59,7 @@ Datastore/auth/secret hints are similarly heuristic and intended as first-pass s
 ## Installation
 
 ```bash
-pip install attackmap-analyzer-php-web
+pip install git+https://github.com/mlaify/attackmap-analyzer-php-web.git
 ```
 
 For local development:
