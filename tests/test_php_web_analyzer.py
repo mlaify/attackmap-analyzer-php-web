@@ -229,3 +229,115 @@ def test_detect_ignores_php_only_under_vendor(tmp_path: Path) -> None:
     (tmp_path / "vendor" / "pkg").mkdir(parents=True)
     (tmp_path / "vendor" / "pkg" / "x.php").write_text("<?php\n")
     assert PhpWebAnalyzer().detect(tmp_path) is False
+
+
+# ---------- Route.auth contract (AttackMap#256) ----------
+
+
+def _routes_by_key(fixture: str) -> dict:
+    result = PhpWebAnalyzer().analyze(FIXTURES / fixture)
+    return {f"{r.method} {r.path}": r for r in result.routes}
+
+
+def test_laravel_guarded_routes_declare_required_auth() -> None:
+    routes = _routes_by_key("route_auth_repo")
+    # Group guard (`Route::middleware([...])->group(...)`).
+    store = routes["POST /posts"]
+    assert store.auth == "required"
+    assert store.guards == ["auth:sanctum"]
+    assert "Route::middleware(['auth:sanctum'" in store.guard_evidence
+    assert routes["DELETE /posts/{id}"].auth == "required"
+    # Route-local `->middleware('auth')` with a `Controller@method` action.
+    assert routes["PATCH /settings"].auth == "required"
+    assert routes["PATCH /settings"].guard_evidence == "->middleware('auth')"
+    # Controller constructor `$this->middleware('auth')`.
+    assert routes["PUT /profile"].auth == "required"
+    assert routes["PUT /profile"].guards == ["auth"]
+
+
+def test_laravel_route_level_opt_outs_are_anonymous() -> None:
+    routes = _routes_by_key("route_auth_repo")
+    # `->withoutMiddleware('auth:sanctum')` inside the auth group.
+    preview = routes["POST /posts/preview"]
+    assert preview.auth == "anonymous"
+    assert preview.guards == []
+    assert preview.guard_evidence == "->withoutMiddleware('auth:sanctum')"
+    # Controller `->except(['show'])` opts the action out of the class guard.
+    assert routes["GET /profile/{id}"].auth == "anonymous"
+    assert "except(['show'])" in routes["GET /profile/{id}"].guard_evidence
+
+
+def test_slim_add_auth_middleware_on_route_or_group() -> None:
+    routes = _routes_by_key("route_auth_repo")
+    assert routes["POST /orders"].auth == "required"
+    assert routes["POST /orders"].guards == ["$authMiddleware"]
+    invoices = routes["POST /invoices"]  # inside `$app->group(...)->add(new JwtAuthentication(...))`
+    assert invoices.auth == "required"
+    assert invoices.guards == ["JwtAuthentication"]
+    # A non-auth middleware decides nothing.
+    assert routes["POST /feedback"].auth == "unknown"
+
+
+def test_symfony_is_granted_and_access_control() -> None:
+    routes = _routes_by_key("route_auth_repo")
+    # Class-level #[IsGranted('ROLE_USER')] guards every action...
+    assert routes["POST /account/email"].auth == "required"
+    assert routes["POST /account/email"].guards == ["IsGranted('ROLE_USER')"]
+    # ...and a method-level PUBLIC_ACCESS doesn't lift it (checks are cumulative).
+    assert routes["PUT /account/avatar"].auth == "required"
+    # Explicitly public action.
+    subscribe = routes["POST /newsletter/subscribe"]
+    assert subscribe.auth == "anonymous"
+    assert subscribe.guard_evidence == "#[IsGranted('PUBLIC_ACCESS')]"
+    # security.yaml access_control, first matching literal prefix wins.
+    assert routes["POST /reports/export"].auth == "required"
+    assert routes["POST /reports/export"].guards == ["access_control ^/reports: ROLE_ANALYST"]
+    assert routes["POST /catalog/import"].auth == "anonymous"
+
+
+def test_undetermined_routes_stay_unknown() -> None:
+    routes = _routes_by_key("route_auth_repo")
+    assert routes["POST /contact"].auth == "unknown"
+    assert routes["POST /contact"].guards == []
+    assert routes["POST /contact"].guard_evidence is None
+    # The pre-existing fixture: one guarded route, one with no guard in sight.
+    laravel = _routes_by_key("laravel_like_repo")
+    assert laravel["GET /users/{id}"].auth == "required"
+    assert laravel["POST /users"].auth == "unknown"
+
+
+def test_access_control_with_conditions_is_not_resolved(tmp_path: Path) -> None:
+    (tmp_path / "config" / "packages").mkdir(parents=True)
+    (tmp_path / "config" / "packages" / "security.yaml").write_text(
+        "security:\n"
+        "    access_control:\n"
+        "        - { path: ^/api, roles: PUBLIC_ACCESS, ips: [127.0.0.1] }\n"
+        "        - { path: ^/api, roles: ROLE_USER }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "Api.php").write_text(
+        "<?php\nclass Api {\n    #[Route('/api/items', methods: ['POST'])]\n    public function create() {}\n}\n",
+        encoding="utf-8",
+    )
+    route = PhpWebAnalyzer().analyze(tmp_path).routes[0]
+    # An `ips:` condition can't be evaluated statically, so nothing after it is trusted.
+    assert route.auth == "unknown"
+
+
+def test_class_guard_does_not_leak_into_a_later_unattributed_class(tmp_path: Path) -> None:
+    (tmp_path / "Controllers.php").write_text(
+        "<?php\n"
+        "#[IsGranted('ROLE_ADMIN')]\n"
+        "class AdminController {\n"
+        "    #[Route('/admin/purge', methods: ['POST'])]\n"
+        "    public function purge() {}\n"
+        "}\n"
+        "class PublicController {\n"
+        "    #[Route('/comments', methods: ['POST'])]\n"
+        "    public function comment() {}\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    routes = {r.path: r for r in PhpWebAnalyzer().analyze(tmp_path).routes}
+    assert routes["/admin/purge"].auth == "required"
+    assert routes["/comments"].auth == "unknown"

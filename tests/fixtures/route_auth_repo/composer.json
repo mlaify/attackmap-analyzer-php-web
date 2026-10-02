@@ -1,0 +1,8 @@
+{
+    "name": "example/route-auth",
+    "require": {
+        "laravel/framework": "^11.0",
+        "slim/slim": "^4.0",
+        "symfony/security-bundle": "^7.0"
+    }
+}

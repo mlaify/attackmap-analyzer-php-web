@@ -52,6 +52,16 @@ Route extraction currently includes patterns such as:
 - PHP attributes like `#[Route("/path", methods: ["GET"]) ]`
 - config-style `"path" => "/..."`, only in files that also declare a `'routes'` / `'router'` key (so Laravel's `config/logging.php` paths aren't routes)
 
+Each route carries `auth`, `guards` and `guard_evidence` (AttackMap#256):
+
+| State | When |
+|---|---|
+| `required` | Laravel `->middleware('auth'…)` on the route, an enclosing `Route::middleware([...])->group(...)` / `Route::group(['middleware' => ...], ...)`, or the controller's `$this->middleware('auth')` (honouring `->only()` / `->except()`); Slim `->add($authMiddleware)` / `->add(new JwtAuthentication(...))` on the route or an enclosing `->group(...)`; Symfony `#[IsGranted]` / `#[Security]` on the action or its class, or a matching `security.yaml` `access_control` rule |
+| `anonymous` | Laravel `->withoutMiddleware('auth')` on the route or a group, or a controller `->except([...])` naming the action; Symfony `#[IsGranted('PUBLIC_ACCESS')]` or an `access_control` rule granting `PUBLIC_ACCESS` — when nothing else requires auth |
+| `unknown` | anything else |
+
+`access_control` is only applied to rules with literal `^/prefix` paths. A rule with `ips`, `host`, `allow_if` or a regex path stops resolution for the routes after it, and routes under a class-level `#[Route]` prefix are skipped. Laravel 11 `HasMiddleware::middleware()` controllers, Slim app-wide `$app->add(...)` and `can:` middleware aren't resolved.
+
 Outbound calls currently include patterns such as:
 
 - `curl_init("https://...")`
