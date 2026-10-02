@@ -4,9 +4,18 @@ import json
 import re
 from pathlib import Path
 
-from attackmap.sdk import iter_repo_files, read_source, rel
+from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, rel
 
-from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, Route, ScanResult, SecretHint
+from .contracts import (
+    AnalyzerMetadata,
+    AuthHint,
+    DatabaseHint,
+    ExternalCall,
+    FrameworkHint,
+    Route,
+    ScanResult,
+    SecretHint,
+)
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
 
@@ -137,25 +146,31 @@ class PhpWebAnalyzer:
 
         for package in requirements:
             lower = package.lower()
+            index = text.find(f'"{package}"')
+            offset = index if index >= 0 else 0
             if "doctrine" in lower:
-                self._append_unique_database(result, "sql", "composer.json")
+                self._append_unique_database(result, "sql", "composer.json", text, offset)
             if "guzzle" in lower or "symfony/http-client" in lower:
-                self._append_unique_auth(result, "http_client", "composer.json")
+                # An HTTP client *library* is a framework capability, not an
+                # outbound call (no target) and not an auth signal (#258).
+                self._append_unique_hint(
+                    result.framework_hints, FrameworkHint, "http_client", "composer.json", text, offset, 0.9
+                )
             if "firebase/php-jwt" in lower:
-                self._append_unique_auth(result, "jwt", "composer.json")
+                self._append_unique_hint(result.auth_hints, AuthHint, "jwt", "composer.json", text, offset)
 
     def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
         for match in LARAVEL_ROUTE_PATTERN.finditer(content):
             method, path = match.group(1).upper(), match.group(2)
             if method == "ANY" or method == "MATCH":
                 method = "ANY"
-            self._append_unique_route(result, path, method, relative)
+            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         for match in SLIM_ROUTE_PATTERN.finditer(content):
             method, path = match.group(1).upper(), match.group(2)
             if method == "MAP" or method == "ANY":
                 method = "ANY"
-            self._append_unique_route(result, path, method, relative)
+            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         for match in ATTRIBUTE_ROUTE_PATTERN.finditer(content):
             path = match.group(1)
@@ -164,62 +179,85 @@ class PhpWebAnalyzer:
             if not methods:
                 methods = ["ANY"]
             for method in methods:
-                self._append_unique_route(result, path, method, relative)
+                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
         for match in CONFIG_ROUTE_PATH_PATTERN.finditer(content):
-            self._append_unique_route(result, match.group(1), "ANY", relative)
+            self._append_unique_route(result, match.group(1), "ANY", relative, line_of(content, match.start()))
 
     def _extract_external_calls(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern in OUTBOUND_PATTERNS:
             for match in pattern.finditer(content):
-                self._append_unique_external(result, match.group(1), relative)
+                self._append_unique_external(result, match.group(1), relative, content, match.start())
 
     def _extract_datastores(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, kind in DATABASE_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_database(result, kind, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_unique_database(result, kind, relative, content, match.start())
 
     def _extract_auth_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern, hint in AUTH_PATTERNS:
-            if pattern.search(content):
-                self._append_unique_auth(result, hint, relative)
+            match = pattern.search(content)
+            if match:
+                self._append_unique_hint(result.auth_hints, AuthHint, hint, relative, content, match.start())
 
     def _extract_secret_hints(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern in SECRET_PATTERNS:
             for match in pattern.finditer(content):
-                self._append_unique_secret(result, match.group(1), relative)
+                self._append_unique_secret(result, match.group(1), relative, content, match.start())
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:
+    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
             return
-        result.routes.append(Route(path=path, method=method, file=file))
+        result.routes.append(Route(path=path, method=method, file=file, line=line))
 
     @staticmethod
-    def _append_unique_external(result: ScanResult, target: str, file: str) -> None:
+    def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:
         key = (target, file)
         if any((item.target, item.file) == key for item in result.external_calls):
             return
-        result.external_calls.append(ExternalCall(target=target, file=file))
+        line = line_of(content, offset)
+        result.external_calls.append(
+            ExternalCall(target=target, file=file, line=line, evidence_text=line_snippet(content, line) or target)
+        )
 
     @staticmethod
-    def _append_unique_database(result: ScanResult, kind: str, file: str) -> None:
+    def _append_unique_database(result: ScanResult, kind: str, file: str, content: str, offset: int) -> None:
         key = (kind, file)
         if any((item.kind, item.file) == key for item in result.databases):
             return
-        result.databases.append(DatabaseHint(kind=kind, file=file))
+        line = line_of(content, offset)
+        result.databases.append(
+            DatabaseHint(kind=kind, file=file, line=line, evidence_text=line_snippet(content, line) or kind)
+        )
 
     @staticmethod
-    def _append_unique_auth(result: ScanResult, hint: str, file: str) -> None:
-        key = (hint, file)
-        if any((item.hint, item.file) == key for item in result.auth_hints):
+    def _append_unique_hint(
+        bucket: list,
+        model: type,
+        hint: str,
+        file: str,
+        content: str,
+        offset: int,
+        confidence: float | None = None,
+    ) -> None:
+        """Append an AuthHint/FrameworkHint once per (hint, file), located at ``offset``."""
+        if any((item.hint, item.file) == (hint, file) for item in bucket):
             return
-        result.auth_hints.append(AuthHint(hint=hint, file=file))
+        line = line_of(content, offset)
+        extra = {"confidence": confidence} if confidence is not None else {}
+        bucket.append(
+            model(hint=hint, file=file, line=line, evidence_text=line_snippet(content, line) or hint, **extra)
+        )
 
     @staticmethod
-    def _append_unique_secret(result: ScanResult, name: str, file: str) -> None:
+    def _append_unique_secret(result: ScanResult, name: str, file: str, content: str, offset: int) -> None:
         key = (name, file)
         if any((item.name, item.file) == key for item in result.secret_hints):
             return
-        result.secret_hints.append(SecretHint(name=name, file=file))
+        line = line_of(content, offset)
+        result.secret_hints.append(
+            SecretHint(name=name, file=file, line=line, evidence_text=line_snippet(content, line) or name)
+        )
