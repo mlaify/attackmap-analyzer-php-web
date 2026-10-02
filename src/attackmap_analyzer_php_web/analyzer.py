@@ -4,6 +4,8 @@ import json
 import re
 from pathlib import Path
 
+from attackmap.sdk import iter_repo_files, read_source, rel
+
 from .contracts import AnalyzerMetadata, AuthHint, DatabaseHint, ExternalCall, Route, ScanResult, SecretHint
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
@@ -85,7 +87,7 @@ class PhpWebAnalyzer:
         if any((root / directory).is_dir() for directory in ("src", "app", "module", "public", "config")):
             return True
 
-        return any(root.rglob("*.php"))
+        return next(iter_repo_files(root, suffixes={".php"}), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
         root = Path(repo_path).resolve()
@@ -94,25 +96,20 @@ class PhpWebAnalyzer:
         if not root.exists() or not root.is_dir():
             return result
 
-        composer_path = root / "composer.json"
-        if composer_path.exists():
-            self._extract_composer_signals(composer_path, result)
+        self._extract_composer_signals(root, result)
 
-        for file_path in root.rglob("*.php"):
-            if not file_path.is_file():
-                continue
-            if any(part in {"vendor", ".git", "node_modules"} for part in file_path.parts):
-                continue
-
+        # Pruned by repo-relative dir name (vendor, node_modules, .git, ...);
+        # symlinks out of the repo are not followed (AttackMap#253).
+        for file_path in iter_repo_files(root, suffixes={".php"}):
             result.files_scanned += 1
             if "php" not in result.languages:
                 result.languages.append("php")
 
-            content = self._read_text(file_path)
+            content = read_source(file_path)
             if content is None:
                 continue
 
-            relative = str(file_path.relative_to(root))
+            relative = rel(file_path, root)
             self._extract_routes(content, relative, result)
             self._extract_external_calls(content, relative, result)
             self._extract_datastores(content, relative, result)
@@ -122,10 +119,15 @@ class PhpWebAnalyzer:
         result.languages.sort()
         return result
 
-    def _extract_composer_signals(self, composer_path: Path, result: ScanResult) -> None:
+    def _extract_composer_signals(self, root: Path, result: ScanResult) -> None:
+        text = read_source(root / "composer.json", root=root)
+        if text is None:
+            return
         try:
-            data = json.loads(composer_path.read_text(encoding="utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict):
             return
 
         requirements = {
@@ -186,13 +188,6 @@ class PhpWebAnalyzer:
         for pattern in SECRET_PATTERNS:
             for match in pattern.finditer(content):
                 self._append_unique_secret(result, match.group(1), relative)
-
-    @staticmethod
-    def _read_text(path: Path) -> str | None:
-        try:
-            return path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            return None
 
     @staticmethod
     def _append_unique_route(result: ScanResult, path: str, method: str, file: str) -> None:

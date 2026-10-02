@@ -1,4 +1,8 @@
+import shutil
+import sys
 from pathlib import Path
+
+import pytest
 
 from attackmap.sdk.contracts import AnalyzerMetadata as SharedAnalyzerMetadata
 from attackmap.sdk.models import ScanResult as SharedScanResult
@@ -103,3 +107,37 @@ def test_analyze_returns_core_compatible_scan_shape() -> None:
     assert hasattr(result, "databases")
     assert hasattr(result, "auth_hints")
     assert hasattr(result, "secret_hints")
+
+
+# ---------------------------------------------------------------------------
+# Repo walking via attackmap.sdk.fs (AttackMap#253)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("parent", ["build/out", "build/vendor"])
+def test_repo_checked_out_under_skip_dir_name_is_still_analyzed(tmp_path: Path, parent: str) -> None:
+    # Skip dirs used to be matched against absolute path parts, so a repo
+    # under any `vendor/` directory yielded no PHP files at all.
+    repo = tmp_path / parent / "repo"
+    shutil.copytree(FIXTURES / "php_web_app", repo)
+    analyzer = PhpWebAnalyzer()
+    assert analyzer.detect(repo) is True
+    result = analyzer.analyze(repo)
+    assert result.files_scanned > 0
+    assert result.routes
+    assert result.external_calls
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+def test_symlinked_source_outside_repo_is_not_analyzed(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.php").write_text("<?php\nRoute::get('/outside-secret', 'x');\n$k = getenv('OUTSIDE_SECRET_KEY');\n")
+    repo = tmp_path / "repo"
+    shutil.copytree(FIXTURES / "php_web_app", repo)
+    (repo / "src" / "linked.php").symlink_to(outside / "secret.php")
+
+    result = PhpWebAnalyzer().analyze(repo)
+    assert "/outside-secret" not in {r.path for r in result.routes}
+    assert "OUTSIDE_SECRET_KEY" not in {s.name for s in result.secret_hints}
+    assert not any(r.file.endswith("linked.php") for r in result.routes)
