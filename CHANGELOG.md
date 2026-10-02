@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
+
+- **`http_client` is now a `FrameworkHint`, not an `AuthHint`.** A Guzzle / `symfony/http-client` entry in `composer.json` says the app *can* make outbound HTTP calls; it isn't an auth signal, and it isn't an `ExternalCall` either (there's no target, and core would draw a fake peer from it). It is emitted as `FrameworkHint(hint="http_client", file="composer.json")` pointing at the package's line. `auth_hints` now carries only auth signals (`session`, `password_hash`, `password_verify`, `jwt`, `auth_middleware`, `auth`); `firebase/php-jwt` in `composer.json` stays a `jwt` `AuthHint`.
+- **Every signal now cites a line and quotes it.** Routes, external calls, databases, auth/framework hints and secret hints carry `line` and (where the model has it) `evidence_text` via `attackmap.sdk.line_of` / `line_snippet`. Composer-declared signals point at the package's line in `composer.json`.
+- New `tests/test_signal_conformance.py` asserts every emitted `AuthHint.hint` is in an explicit auth allow-list and every signal has an in-range `line` and evidence.
+
 ### Fixed — AttackMap#253
 
 - **Repo walking now uses `attackmap.sdk.fs`.** `detect()` and `analyze()` walk with `iter_repo_files` and read with `read_source`. Skip dirs are matched by repo-relative name and pruned, so a repo checked out under a `vendor/` directory is analyzed instead of yielding no PHP files.

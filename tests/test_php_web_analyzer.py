@@ -95,6 +95,32 @@ def test_analyze_extracts_datastore_auth_and_secret_hints() -> None:
     assert "ACCESS_TOKEN" in secret_names
 
 
+def test_http_client_dependency_is_a_framework_hint_not_auth(tmp_path: Path) -> None:
+    # Guzzle in composer.json used to be emitted as the AuthHint `http_client`
+    # (AttackMap#258). It is a library capability: a FrameworkHint citing the
+    # composer.json line. firebase/php-jwt stays a genuine auth signal.
+    (tmp_path / "composer.json").write_text(
+        '{\n  "require": {\n    "guzzlehttp/guzzle": "^7.8",\n    "firebase/php-jwt": "^6.0"\n  }\n}\n'
+    )
+    result = PhpWebAnalyzer().analyze(tmp_path)
+
+    assert [h.hint for h in result.auth_hints] == ["jwt"]
+    jwt = result.auth_hints[0]
+    assert (jwt.file, jwt.line, jwt.evidence_text) == ("composer.json", 4, '"firebase/php-jwt": "^6.0"')
+    assert [h.hint for h in result.framework_hints] == ["http_client"]
+    client = result.framework_hints[0]
+    assert (client.file, client.line, client.evidence_text) == ("composer.json", 3, '"guzzlehttp/guzzle": "^7.8",')
+
+
+def test_auth_hints_cite_the_matching_line() -> None:
+    root = FIXTURES / "php_web_app"
+    result = PhpWebAnalyzer().analyze(root)
+    assert result.auth_hints
+    for hint in result.auth_hints:
+        lines = (root / hint.file).read_text().split("\n")
+        assert hint.evidence_text == lines[hint.line - 1].strip()
+
+
 def test_analyze_returns_core_compatible_scan_shape() -> None:
     analyzer = PhpWebAnalyzer()
     result = analyzer.analyze(FIXTURES / "php_web_app")
