@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — route-level auth (#8, AttackMap#256)
+
+- **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the control and `guard_evidence` quoting the source text. AttackMap ≥ 0.6 trusts it over its ±40-line auth-hint window, which can't see PHP guards and let one guarded route mask its neighbours. Older cores ignore the fields, and the `auth_middleware` hint is kept for one release.
+- **Laravel:** `->middleware('auth' | 'auth:<guard>' | 'auth.basic' | Authenticate::class)` on the route, an enclosing `Route::middleware([...])->group(...)` or `Route::group(['middleware' => ...], ...)`, and a controller constructor's `$this->middleware('auth')` with `->only()` / `->except()`, matched to `[Controller::class, 'method']` / `'Controller@method'` / invokable actions across files. `->withoutMiddleware('auth')` on a route or group, and a controller `->except([...])` naming the action, are explicit opt-outs and make the route `anonymous`.
+- **Slim:** `->add($authMiddleware)` / `->add(new JwtAuthentication(...))` on a route or on an enclosing `$app->group(...)`.
+- **Symfony:** `#[IsGranted]` / `#[Security]` on the action or its class (cumulative, so a method's `PUBLIC_ACCESS` doesn't lift a class-level role), and `security.yaml` `access_control` rules with literal `^/prefix` paths. `PUBLIC_ACCESS` / `IS_AUTHENTICATED_ANONYMOUSLY` with nothing else requiring auth is `anonymous`. Rules with `ips` / `host` / `allow_if` or regex paths stop resolution, so the routes after them stay `unknown`.
+- Brackets are matched in one cached forward pass per file, and argument scans and group nesting are bounded, so 200 KB of adversarial input stays linear.
+
 ### Fixed — false positives on ordinary PHP (#2)
 
 - **`$obj->get('key')` is no longer a route.** Slim-style `$x->get(...)` routes need a path that starts with `/` and a router receiver. That means `$app`, `$router`, `$route`, `$group` or `$r`, a variable assigned from `AppFactory::create()` / `Bridge::create()` / `new App` / `new RouteCollector`, or a parameter typed `RouteCollectorProxy` / `RouteCollector` / `App` (route-group closures). `$request->get('id')`, `$cache->get('user:…')`, `$config->get(…)` and `$session->get(…)` are no longer GET routes.

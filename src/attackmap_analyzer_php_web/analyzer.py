@@ -6,6 +6,7 @@ from pathlib import Path
 
 from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, rel
 
+from . import route_auth as ra
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -51,6 +52,13 @@ ATTRIBUTE_METHOD_PATTERN = re.compile(r"['\"](GET|POST|PUT|PATCH|DELETE|OPTIONS|
 # dirs) is a file path, not a route.
 CONFIG_ROUTE_PATH_PATTERN = re.compile(r"['\"]path['\"]\s*=>\s*['\"](/[^'\"]*)['\"]")
 CONFIG_ROUTES_KEY_PATTERN = re.compile(r"['\"](?:routes|router)['\"]\s*=>")
+# Symfony security config whose `access_control` rules guard attribute routes.
+SECURITY_CONFIG_PATHS = (
+    "config/packages/security.yaml",
+    "config/packages/security.yml",
+    "config/security.yaml",
+    "app/config/security.yml",
+)
 
 OUTBOUND_PATTERNS = [
     re.compile(r"curl_init\s*\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
@@ -137,6 +145,12 @@ class PhpWebAnalyzer:
             return result
 
         self._extract_composer_signals(root, result)
+        access_rules = self._load_access_control(root)
+        # Laravel routes are resolved after the walk: a controller's
+        # constructor middleware lives in another file (route index, scope,
+        # action).
+        laravel_pending: list[tuple[int, ra.LaravelScope, list[ra.LaravelGroup], tuple[str, str] | None]] = []
+        controllers: dict[str, list[ra.ControllerGuard]] = {}
 
         # Pruned by repo-relative dir name (vendor, node_modules, .git, ...);
         # symlinks out of the repo are not followed (AttackMap#253).
@@ -150,14 +164,29 @@ class PhpWebAnalyzer:
                 continue
 
             relative = rel(file_path, root)
-            self._extract_routes(content, relative, result)
+            self._extract_routes(content, relative, result, access_rules, laravel_pending)
+            for cls, guards in ra.laravel_controller_guards(content).items():
+                controllers.setdefault(cls, []).extend(guards)
             self._extract_external_calls(content, relative, result)
             self._extract_datastores(content, relative, result)
             self._extract_auth_hints(content, relative, result)
             self._extract_secret_hints(content, relative, result)
 
+        for index, scope, groups, action in laravel_pending:
+            self._set_route_auth(result, index, ra.resolve_laravel(scope, groups, action, controllers))
+
         result.languages.sort()
         return result
+
+    @staticmethod
+    def _load_access_control(root: Path) -> list[ra.AccessRule]:
+        for candidate in SECURITY_CONFIG_PATHS:
+            if not (root / candidate).is_file():
+                continue
+            text = read_source(root / candidate, root=root)
+            if text is not None:
+                return ra.parse_access_control(text)
+        return []
 
     def _extract_composer_signals(self, root: Path, result: ScanResult) -> None:
         text = read_source(root / "composer.json", root=root)
@@ -190,37 +219,118 @@ class PhpWebAnalyzer:
             if "firebase/php-jwt" in lower:
                 self._append_unique_hint(result.auth_hints, AuthHint, "jwt", "composer.json", text, offset)
 
-    def _extract_routes(self, content: str, relative: str, result: ScanResult) -> None:
-        for match in LARAVEL_ROUTE_PATTERN.finditer(content):
+    def _extract_routes(
+        self,
+        content: str,
+        relative: str,
+        result: ScanResult,
+        access_rules: list[ra.AccessRule] | None = None,
+        laravel_pending: list | None = None,
+    ) -> None:
+        laravel_matches = list(LARAVEL_ROUTE_PATTERN.finditer(content))
+        laravel_groups = ra.laravel_groups(content) if laravel_matches else []
+        laravel_enclosing = ra.enclosing(laravel_groups, [m.start() for m in laravel_matches])
+        for match, enclosing in zip(laravel_matches, laravel_enclosing):
             method, path = match.group(1).upper(), match.group(2)
             if method == "ANY" or method == "MATCH":
                 method = "ANY"
-            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+            index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+            if index is None or laravel_pending is None or enclosing is None:
+                continue
+            open_idx = content.find("(", match.start())
+            close = ra.matching_close(content, open_idx)
+            if close < 0:
+                continue
+            scope = ra.LaravelScope()
+            scope.add_links(ra.parse_chain(content, close + 1))
+            laravel_pending.append((index, scope, enclosing, ra.laravel_action(content, open_idx, close)))
 
         routers = set(SLIM_ROUTER_NAMES)
         routers.update(SLIM_ROUTER_ASSIGN_PATTERN.findall(content))
         routers.update(SLIM_ROUTER_PARAM_PATTERN.findall(content))
-        for match in SLIM_ROUTE_PATTERN.finditer(content):
-            receiver, method, path = match.group(1), match.group(2).upper(), match.group(3)
-            if receiver not in routers:
-                continue
+        slim_matches = [m for m in SLIM_ROUTE_PATTERN.finditer(content) if m.group(1) in routers]
+        slim_groups = ra.slim_groups(content, routers) if slim_matches and "->group" in content else []
+        slim_enclosing = ra.enclosing(slim_groups, [m.start() for m in slim_matches])
+        for match, enclosing in zip(slim_matches, slim_enclosing):
+            method, path = match.group(2).upper(), match.group(3)
             if method == "MAP" or method == "ANY":
                 method = "ANY"
-            self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+            index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+            if index is None or enclosing is None:
+                continue
+            close = ra.matching_close(content, content.find("(", match.start()))
+            links = ra.parse_chain(content, close + 1) if close > 0 else []
+            self._set_route_auth(result, index, ra.resolve_slim(links, enclosing))
 
+        blocks = ra.attribute_blocks(content) if ATTRIBUTE_ROUTE_PATTERN.search(content) else []
+        block_of = {offset: block for block in blocks for offset, _ in block.attributes}
+        class_blocks = {block.target_offset: block for block in blocks if block.target == "class"}
+        decl_ends = ra.class_decl_ends(content) if blocks else []
         for match in ATTRIBUTE_ROUTE_PATTERN.finditer(content):
             path = match.group(1)
             args = match.group("args")
             methods = [m.upper() for m in ATTRIBUTE_METHOD_PATTERN.findall(args)]
             if not methods:
                 methods = ["ANY"]
+            block = block_of.get(match.start())
             for method in methods:
-                self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
+                if index is not None:
+                    resolution = self._symfony_resolution(
+                        block, decl_ends, class_blocks, path, method, access_rules or []
+                    )
+                    self._set_route_auth(result, index, resolution)
 
         if not CONFIG_ROUTES_KEY_PATTERN.search(content):
             return
         for match in CONFIG_ROUTE_PATH_PATTERN.finditer(content):
             self._append_unique_route(result, match.group(1), "ANY", relative, line_of(content, match.start()))
+
+    @staticmethod
+    def _symfony_resolution(
+        block: ra.AttributeBlock | None,
+        decl_ends: list[int],
+        class_blocks: dict[int, ra.AttributeBlock],
+        path: str,
+        method: str,
+        access_rules: list[ra.AccessRule],
+    ) -> ra.Resolution:
+        if block is None:
+            return ra.Resolution()
+        states = [g for _, text in block.attributes if (g := ra.symfony_guard(text))]
+        prefixed = block.target == "class"
+        if block.target == "function":
+            owner = ra.owning_class(decl_ends, class_blocks, block.target_offset)
+            if owner is not None:
+                states += [g for _, text in owner.attributes if (g := ra.symfony_guard(text))]
+                prefixed = any(ATTRIBUTE_ROUTE_PATTERN.match("#[" + text + "]") for _, text in owner.attributes)
+        # access_control matches the full path; a class-level #[Route] prefix
+        # isn't joined onto method paths here, so skip it for those routes.
+        if access_rules and not prefixed:
+            rule = ra.resolve_access_control(access_rules, path, method)
+            if rule is not None:
+                states.append(rule)
+        return ra.combine(states)
+
+    @staticmethod
+    def _set_route_auth(result: ScanResult, index: int, resolution: ra.Resolution) -> None:
+        """Declare a route's auth (AttackMap#256). Older cores ignore the fields."""
+        if resolution.auth == ra.UNKNOWN:
+            return
+        route = result.routes[index]
+        if getattr(route, "auth", ra.UNKNOWN) != ra.UNKNOWN:
+            return  # the first registration of a duplicate route wins
+        # Rebuilt rather than mutated so Route's validators (guard_evidence
+        # redaction) run.
+        result.routes[index] = Route(
+            path=route.path,
+            method=route.method,
+            file=route.file,
+            line=route.line,
+            auth=resolution.auth,
+            guards=list(resolution.guards),
+            guard_evidence=resolution.evidence,
+        )
 
     def _extract_external_calls(self, content: str, relative: str, result: ScanResult) -> None:
         for pattern in OUTBOUND_PATTERNS:
@@ -245,11 +355,29 @@ class PhpWebAnalyzer:
                 self._append_unique_secret(result, match.group(1), relative, content, match.start())
 
     @staticmethod
-    def _append_unique_route(result: ScanResult, path: str, method: str, file: str, line: int) -> None:
+    def _append_unique_route(
+        result: ScanResult,
+        path: str,
+        method: str,
+        file: str,
+        line: int,
+        *,
+        auth: str = ra.UNKNOWN,
+        guards: list[str] | None = None,
+        guard_evidence: str | None = None,
+    ) -> int | None:
+        """Append a route once per (path, method, file); return its index, or
+        None when it was already recorded."""
         key = (path, method, file)
         if any((item.path, item.method, item.file) == key for item in result.routes):
-            return
-        result.routes.append(Route(path=path, method=method, file=file, line=line))
+            return None
+        result.routes.append(
+            Route(
+                path=path, method=method, file=file, line=line,
+                auth=auth, guards=list(guards or []), guard_evidence=guard_evidence,
+            )
+        )
+        return len(result.routes) - 1
 
     @staticmethod
     def _append_unique_external(result: ScanResult, target: str, file: str, content: str, offset: int) -> None:

@@ -1,0 +1,8 @@
+security:
+    firewalls:
+        main:
+            lazy: true
+    access_control:
+        - { path: ^/reports, roles: ROLE_ANALYST }
+        - path: ^/catalog
+          roles: PUBLIC_ACCESS
