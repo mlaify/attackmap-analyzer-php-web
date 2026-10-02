@@ -23,16 +23,34 @@ LARAVEL_ROUTE_PATTERN = re.compile(
     r"\bRoute::(get|post|put|patch|delete|options|head|any|match)\s*\(\s*['\"]([^'\"]+)['\"]",
     re.IGNORECASE,
 )
+# Slim / FastRoute-style `$app->get('/path', ...)`. The same shape is every
+# `$request->get('id')`, `$cache->get('k')` and `$config->get(...)`, so the
+# path must be rooted (`/...`) and the receiver must be a router: one of
+# SLIM_ROUTER_NAMES, a variable assigned from SLIM_ROUTER_ASSIGN_PATTERN, or a
+# parameter typed by SLIM_ROUTER_PARAM_PATTERN (route-group closures).
 SLIM_ROUTE_PATTERN = re.compile(
-    r"\$\w+->(get|post|put|patch|delete|options|head|any|map)\s*\(\s*['\"]([^'\"]+)['\"]",
+    r"\$(\w+)->(get|post|put|patch|delete|options|head|any|map)\s*\(\s*['\"](/[^'\"]*)['\"]",
     re.IGNORECASE,
+)
+SLIM_ROUTER_NAMES = frozenset({"app", "router", "route", "group", "r"})
+SLIM_ROUTER_ASSIGN_PATTERN = re.compile(
+    r"\$(\w+)\s*=\s*(?:AppFactory::create(?:FromContainer)?\s*\(|Bridge::create\s*\(|"
+    r"new\s+\\?(?:Slim\\)?(?:App|RouteCollector)\b|new\s+\\?FastRoute\\RouteCollector\b)",
+)
+SLIM_ROUTER_PARAM_PATTERN = re.compile(
+    r"\b(?:RouteCollectorProxy(?:Interface)?|RouteCollector|App)\s+\$(\w+)",
 )
 ATTRIBUTE_ROUTE_PATTERN = re.compile(
     r"#\[\s*Route\s*\(\s*['\"]([^'\"]+)['\"](?P<args>.*?)\)\s*\]",
     re.IGNORECASE | re.DOTALL,
 )
 ATTRIBUTE_METHOD_PATTERN = re.compile(r"['\"](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)['\"]", re.IGNORECASE)
-CONFIG_ROUTE_PATH_PATTERN = re.compile(r"['\"]path['\"]\s*=>\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+# Config-array routes (Mezzio-style `'routes' => [['path' => '/x', ...]]`).
+# Only rooted paths in files that declare a `'routes'`/`'router'` key: every
+# other `'path' =>` (Laravel `config/logging.php`, filesystem disks, cache
+# dirs) is a file path, not a route.
+CONFIG_ROUTE_PATH_PATTERN = re.compile(r"['\"]path['\"]\s*=>\s*['\"](/[^'\"]*)['\"]")
+CONFIG_ROUTES_KEY_PATTERN = re.compile(r"['\"](?:routes|router)['\"]\s*=>")
 
 OUTBOUND_PATTERNS = [
     re.compile(r"curl_init\s*\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
@@ -55,15 +73,28 @@ AUTH_PATTERNS = [
     (re.compile(r"\$_SESSION\b", re.IGNORECASE), "session"),
     (re.compile(r"\bpassword_hash\s*\(", re.IGNORECASE), "password_hash"),
     (re.compile(r"\bpassword_verify\s*\(", re.IGNORECASE), "password_verify"),
-    (re.compile(r"JWT|firebase\\jwt", re.IGNORECASE), "jwt"),
-    (re.compile(r"\bmiddleware\s*\(\s*['\"]auth['\"]", re.IGNORECASE), "auth_middleware"),
-    (re.compile(r"\bAuth::|\bauth\s*\(", re.IGNORECASE), "auth"),
+    # A JWT library, not any "jwt" substring (`$jwtSecret`, comments).
+    (
+        re.compile(
+            r"Firebase\\JWT\\JWT|\bJWT::(?:decode|encode)\b|Lcobucci\\JWT|lcobucci/jwt"
+            r"|Tymon\\JWTAuth|tymon/jwt-auth|\bJWTAuth::"
+        ),
+        "jwt",
+    ),
+    (re.compile(r"\bmiddleware\s*\(\s*['\"]auth(?::[\w,-]+)?['\"]", re.IGNORECASE), "auth_middleware"),
+    # Laravel's Auth facade or the `auth()` / `auth('guard')` helper chained
+    # into a guard call, not any function or method named `auth(`.
+    (re.compile(r"\bAuth::|(?<![\w$>:\\])auth\s*\(\s*(?:['\"][\w-]*['\"]\s*)?\)\s*->"), "auth"),
 ]
 
+# Secret-shaped env var names only. `API`/`DB` on their own matched
+# `DB_HOST`/`API_URL`; `DB_PASSWORD`/`API_KEY`/`API_TOKEN` still match via
+# PASSWORD/KEY/TOKEN. Case-sensitive: env var names are upper-case.
+_SECRET_NAME = r"([A-Z0-9_]*(?:SECRET|TOKEN|KEY|PASSWORD|PASSWD)[A-Z0-9_]*)"
 SECRET_PATTERNS = [
-    re.compile(r"getenv\s*\(\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]", re.IGNORECASE),
-    re.compile(r"\$_ENV\s*\[\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]\s*\]", re.IGNORECASE),
-    re.compile(r"\$_SERVER\s*\[\s*['\"]([A-Z0-9_]*(SECRET|TOKEN|KEY|PASSWORD|API|DB)[A-Z0-9_]*)['\"]\s*\]", re.IGNORECASE),
+    re.compile(r"getenv\s*\(\s*['\"]" + _SECRET_NAME + r"['\"]"),
+    re.compile(r"\$_ENV\s*\[\s*['\"]" + _SECRET_NAME + r"['\"]\s*\]"),
+    re.compile(r"\$_SERVER\s*\[\s*['\"]" + _SECRET_NAME + r"['\"]\s*\]"),
 ]
 
 
@@ -93,9 +124,9 @@ class PhpWebAnalyzer:
         if (root / "composer.json").exists():
             return True
 
-        if any((root / directory).is_dir() for directory in ("src", "app", "module", "public", "config")):
-            return True
-
+        # A `src/`/`app/`/`config/` dir alone says nothing about the language
+        # (it matched Python, Go and Java repos): require a PHP source file
+        # outside vendor/ (the walker prunes vendor, node_modules, ...).
         return next(iter_repo_files(root, suffixes={".php"}), None) is not None
 
     def analyze(self, repo_path: str | Path) -> ScanResult:
@@ -166,8 +197,13 @@ class PhpWebAnalyzer:
                 method = "ANY"
             self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
+        routers = set(SLIM_ROUTER_NAMES)
+        routers.update(SLIM_ROUTER_ASSIGN_PATTERN.findall(content))
+        routers.update(SLIM_ROUTER_PARAM_PATTERN.findall(content))
         for match in SLIM_ROUTE_PATTERN.finditer(content):
-            method, path = match.group(1).upper(), match.group(2)
+            receiver, method, path = match.group(1), match.group(2).upper(), match.group(3)
+            if receiver not in routers:
+                continue
             if method == "MAP" or method == "ANY":
                 method = "ANY"
             self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
@@ -181,6 +217,8 @@ class PhpWebAnalyzer:
             for method in methods:
                 self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
 
+        if not CONFIG_ROUTES_KEY_PATTERN.search(content):
+            return
         for match in CONFIG_ROUTE_PATH_PATTERN.finditer(content):
             self._append_unique_route(result, match.group(1), "ANY", relative, line_of(content, match.start()))
 

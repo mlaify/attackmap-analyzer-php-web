@@ -1,0 +1,4 @@
+{
+  "name": "acme/api",
+  "require": { "slim/slim": "^4.12", "symfony/routing": "^7.0", "firebase/php-jwt": "^6.0" }
+}

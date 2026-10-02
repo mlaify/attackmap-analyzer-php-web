@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — false positives on ordinary PHP (#2)
+
+- **`$obj->get('key')` is no longer a route.** Slim-style `$x->get(...)` routes need a path that starts with `/` and a router receiver. That means `$app`, `$router`, `$route`, `$group` or `$r`, a variable assigned from `AppFactory::create()` / `Bridge::create()` / `new App` / `new RouteCollector`, or a parameter typed `RouteCollectorProxy` / `RouteCollector` / `App` (route-group closures). `$request->get('id')`, `$cache->get('user:…')`, `$config->get(…)` and `$session->get(…)` are no longer GET routes.
+- **Config `'path' =>` routes need a routes table.** They are only read from files that declare a `'routes'` or `'router'` key, and the path must start with `/`. Laravel's `config/logging.php` no longer yields `ANY /var/log/laravel.log`.
+- **`DB_*` / `API_*` settings are not secrets.** Secret env names must contain `SECRET`, `TOKEN`, `KEY`, `PASSWORD` or `PASSWD`, matched case-sensitively. `getenv('DB_HOST')` and `getenv('API_URL')` no longer match. `DB_PASSWORD`, `API_KEY` and `API_TOKEN` still do.
+- **`jwt` needs a JWT library.** The case-insensitive `JWT` substring matched any `$jwtSecret` variable or comment. The hint now needs `Firebase\JWT\JWT`, `JWT::decode/encode`, `Lcobucci\JWT`, `tymon/jwt-auth` or `JWTAuth::`.
+- **`auth` needs Laravel's facade or helper.** `\bauth\s*\(` matched any `auth(` function or method. The hint now needs `Auth::` or a chained `auth()->…` / `auth('guard')->…`. `->middleware('auth:sanctum')` (a guard suffix) now counts as `auth_middleware`.
+- **`detect()` no longer fires on any repo with `src/`.** A `src/`, `app/`, `module/`, `public/` or `config/` directory alone used to make php-web run on Python, Go and Java repos. It now needs `composer.json` or a `.php` file outside `vendor/` and the other shared skip dirs.
+
 ### Changed — typed signals instead of overloaded `AuthHint`s (AttackMap#258)
 
 - **`http_client` is now a `FrameworkHint`, not an `AuthHint`.** A Guzzle / `symfony/http-client` entry in `composer.json` says the app *can* make outbound HTTP calls; it isn't an auth signal, and it isn't an `ExternalCall` either (there's no target, and core would draw a fake peer from it). It is emitted as `FrameworkHint(hint="http_client", file="composer.json")` pointing at the package's line. `auth_hints` now carries only auth signals (`session`, `password_hash`, `password_verify`, `jwt`, `auth_middleware`, `auth`); `firebase/php-jwt` in `composer.json` stays a `jwt` `AuthHint`.
