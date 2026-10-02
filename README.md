@@ -36,9 +36,10 @@ This analyzer is broad and heuristic. It is meant to map common PHP web applicat
 
 `detect(repo_path)` uses lightweight signals:
 
-- `composer.json` present
-- at least one `.php` file
-- common PHP app layout (`src/`, `app/`, `module/`, `public/`)
+- `composer.json` present, or
+- at least one `.php` file outside `vendor/` (and the other shared skip dirs)
+
+A `src/`, `app/` or `config/` directory on its own is not enough, since Python, Go and Java repos have those too.
 
 ## Extraction strategy
 
@@ -47,9 +48,9 @@ This analyzer is broad and heuristic. It is meant to map common PHP web applicat
 Route extraction currently includes patterns such as:
 
 - `Route::get(...)`/`Route::post(...)` style calls
-- `$app->get(...)` style calls
+- `$app->get('/path', ...)` style calls. The path must start with `/`, and the receiver must be `$app`, `$router`, `$route`, `$group` or `$r`, a variable assigned from `AppFactory::create()` / `new RouteCollector` / `new App`, or a parameter typed `RouteCollectorProxy` / `RouteCollector` / `App`. This keeps `$request->get('id')` and `$cache->get('k')` out.
 - PHP attributes like `#[Route("/path", methods: ["GET"]) ]`
-- basic config-style `"path" => "/..."`
+- config-style `"path" => "/..."`, only in files that also declare a `'routes'` / `'router'` key (so Laravel's `config/logging.php` paths aren't routes)
 
 Outbound calls currently include patterns such as:
 
@@ -57,7 +58,7 @@ Outbound calls currently include patterns such as:
 - `file_get_contents("https://...")`
 - common HTTP client calls such as `->request(...)`, `->get(...)`, `->post(...)`
 
-Datastore/auth/secret hints are similarly heuristic and intended as first-pass signals.
+Datastore/auth/secret hints are similarly heuristic and intended as first-pass signals. Secret hints are env var names (`getenv`, `$_ENV`, `$_SERVER`) containing `SECRET`, `TOKEN`, `KEY`, `PASSWORD` or `PASSWD`. `DB_HOST`-style connection settings are not secrets. `jwt` needs a JWT library (`Firebase\JWT\JWT`, `JWT::decode/encode`, `Lcobucci\JWT`, `tymon/jwt-auth`), and `auth` needs the `Auth::` facade or a chained `auth()->…` helper.
 
 ## Installation
 
