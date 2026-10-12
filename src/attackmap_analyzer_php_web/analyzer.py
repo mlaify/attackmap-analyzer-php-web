@@ -236,30 +236,67 @@ class PhpWebAnalyzer:
         sites: dict[str, list] = {}
         for relative, (_, scan) in scans.items():
             for mount in scan.mounts:
-                sites.setdefault(mount.target, []).append((relative, mount.groups))
+                sites.setdefault(mount.target, []).append((relative, mount.groups, mount.once))
         resolver = lr.MountResolver(sites, (lr.LITERAL, "api"))
         config_cache: dict[str, str | None] = {}
         for relative, (content, scan) in scans.items():
             if not scan.routes:
                 continue
             chains = resolver.chains(relative)
+            # The enclosing groups are fixed by the innermost one, so each
+            # (mount chain, innermost group) pair is joined and merged once,
+            # not once per route.
+            merged: dict[tuple[int, int | None], tuple[str | None, lr.LaravelGroup] | None] = {}
+            resolved: dict[tuple, ra.Resolution] = {}
             for route in scan.routes:
                 line = line_of(content, route.offset)
-                for chain in chains:
-                    groups = None if chain is None or route.groups is None else chain + route.groups
-                    if groups is None:
+                inner = id(route.groups[-1]) if route.groups else (None if route.groups is None else 0)
+                for index_chain, chain in enumerate(chains):
+                    key = (index_chain, inner)
+                    if key not in merged:
+                        merged[key] = self._merge_groups(root, chain, route.groups, config_cache)
+                    joined = merged[key]
+                    if joined is None:
                         # Nested past MAX_NESTING or mounted in a cycle: the
                         # prefix and the enclosing middleware are unknown.
                         path = lr.join_path([(lr.DYNAMIC, "")], route.uri)
                     else:
-                        prefixes = [self._resolve_prefix(root, g.prefix, config_cache) for g in groups]
-                        path = lr.join_path(prefixes, route.uri)
+                        path = lr.join_base(joined[0], route.uri)
                     for method in route.methods:
                         index = self._append_unique_route(result, path, method, relative, line, seen=seen)
-                        if index is None or groups is None:
+                        if index is None or joined is None:
                             continue
-                        resolution = ra.resolve_laravel(route.scope, groups, route.action, controllers)
-                        self._set_route_auth(result, index, resolution)
+                        # Same groups, route-level middleware and controller
+                        # guard -> same resolution.
+                        guarded = route.action if route.action and route.action[0] in controllers else None
+                        rkey = (key, tuple(route.scope.applied), tuple(route.scope.excluded), guarded)
+                        if rkey not in resolved:
+                            resolved[rkey] = ra.resolve_laravel(route.scope, [joined[1]], guarded, controllers)
+                        self._set_route_auth(result, index, resolved[rkey])
+
+    def _merge_groups(
+        self,
+        root: Path,
+        chain: list | None,
+        groups: list | None,
+        config_cache: dict[str, str | None],
+    ) -> tuple[str | None, lr.LaravelGroup] | None:
+        """The joined prefix and the merged middleware of ``chain + groups``."""
+        if chain is None or groups is None:
+            return None
+        outer = chain + groups
+        prefixes = [self._resolve_prefix(root, group.prefix, config_cache) for group in outer]
+        # One entry per middleware name (the outermost evidence), so the
+        # merged scope is as long as the distinct names, not the groups.
+        applied: dict[str, tuple[str, str]] = {}
+        excluded: dict[str, tuple[str, str]] = {}
+        for group in outer:
+            for name, evidence in group.scope.applied:
+                applied.setdefault(name, (name, evidence))
+            for name, evidence in group.scope.excluded:
+                excluded.setdefault(name, (name, evidence))
+        scope = ra.LaravelScope(list(applied.values()), list(excluded.values()))
+        return lr.prefix_base(prefixes), lr.LaravelGroup(-1, -1, scope)
 
     @staticmethod
     def _resolve_prefix(root: Path, prefix: lr.Prefix, cache: dict[str, str | None]) -> lr.Prefix:
@@ -381,7 +418,7 @@ class PhpWebAnalyzer:
             return
         decl_ends = ra.class_decl_ends(content)
         class_blocks = {block.target_offset: block for block in blocks if block.target == "class"}
-        import_prefix = route_config.prefix_for(relative) if route_config else ""
+        import_prefixes = route_config.prefixes_for(relative) if route_config else [""]
         # (offset, path, methods, block, owner class block)
         found: list[tuple[int, str, list[str], ra.AttributeBlock, ra.AttributeBlock | None]] = []
         prefixed_classes: set[int] = set()
@@ -414,13 +451,17 @@ class PhpWebAnalyzer:
         found.sort(key=lambda item: item[0])
         for offset, path, methods, block, owner in found:
             line = line_of(content, offset)
-            full = sf.import_prefix(import_prefix, path)
-            # access_control is only matched against a fully known path.
-            rules = access_rules if lr.DYNAMIC_SEGMENT not in full else []
-            for method in methods or ["ANY"]:
-                index = self._append_unique_route(result, full, method, relative, line, seen=seen)
-                if index is not None:
-                    self._set_route_auth(result, index, self._symfony_resolution(block, owner, full, method, rules))
+            # One route per live import (imports with different name
+            # prefixes all register it).
+            for import_prefix in import_prefixes:
+                full = sf.import_prefix(import_prefix, path)
+                # access_control is only matched against a fully known path.
+                rules = access_rules if lr.DYNAMIC_SEGMENT not in full else []
+                for method in methods or ["ANY"]:
+                    index = self._append_unique_route(result, full, method, relative, line, seen=seen)
+                    if index is not None:
+                        resolution = self._symfony_resolution(block, owner, full, method, rules)
+                        self._set_route_auth(result, index, resolution)
 
     @staticmethod
     def _route_attrs(block: ra.AttributeBlock) -> list[tuple[int, sf.RouteAttr]]:

@@ -31,3 +31,7 @@ when@dev:
     dev_tools:
         path: /_dev/tools
         controller: App\Dev\ToolsController
+
+# The kernel only auto-loads config/routes/*.yaml; XML there is imported.
+legacy_xml:
+    resource: routes/legacy.xml

@@ -39,6 +39,8 @@ DYNAMIC_SEGMENT = "{prefix}"
 _OPEN = "([{"
 _CLOSE = ")]}"
 _EVIDENCE_MAX = 200
+# Guard names reported per route (the evidence is clipped too).
+MAX_GUARDS = 16
 
 
 @dataclass
@@ -351,7 +353,7 @@ def resolve_laravel(
     excluded_bases = {_base(name) for name, _ in excluded}
     remaining = [(name, ev) for name, ev in applied if _base(name) not in excluded_bases]
     if remaining:
-        guards = list(dict.fromkeys(name for name, _ in remaining))
+        guards = list(dict.fromkeys(name for name, _ in remaining))[:MAX_GUARDS]
         return Resolution(REQUIRED, guards, clip("; ".join(dict.fromkeys(ev for _, ev in remaining))))
     if excluded or controller_excepted:
         evidence = [ev for _, ev in excluded] + controller_excepted
@@ -440,7 +442,7 @@ def resolve_slim(route_links: list[Link], groups: list[SlimGroup]) -> Resolution
     for group in groups:
         guards += group.guards
     if guards:
-        names = list(dict.fromkeys(name for name, _ in guards))
+        names = list(dict.fromkeys(name for name, _ in guards))[:MAX_GUARDS]
         return Resolution(REQUIRED, names, clip("; ".join(dict.fromkeys(ev for _, ev in guards))))
     return Resolution()
 
@@ -658,7 +660,7 @@ def combine(states: list[tuple[str, str, str]]) -> Resolution:
     required; explicitly public only when nothing requires auth."""
     required = [(guard, ev) for state, guard, ev in states if state == REQUIRED]
     if required:
-        guards = list(dict.fromkeys(guard for guard, _ in required))
+        guards = list(dict.fromkeys(guard for guard, _ in required))[:MAX_GUARDS]
         return Resolution(REQUIRED, guards, clip("; ".join(dict.fromkeys(ev for _, ev in required))))
     anonymous = list(dict.fromkeys(ev for state, _, ev in states if state == ANONYMOUS))
     if anonymous:

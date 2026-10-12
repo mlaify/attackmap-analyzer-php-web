@@ -91,8 +91,10 @@ MAX_RESOURCES = 64
 # distinct mount chains per file.
 MAX_MOUNT_DEPTH = 8
 MAX_MOUNT_CHAINS = 8
-# Mount edges followed per repo before the rest stay unresolved.
+# Mount edges followed per repo before the rest stay unresolved, and the
+# recursion depth of one resolution.
 MAX_MOUNT_VISITS = 4096
+MAX_MOUNT_PATH = 64
 
 _STATEMENT = re.compile(r"\bRoute::(\w+)\s*\(")
 _STRING_ARG = re.compile(r"\s*(?:'([^'\\]*)'|\"([^\"\\]*)\")")
@@ -113,6 +115,10 @@ _MOUNT_REF = re.compile(
 _MOUNT_LEAD = re.compile(
     r"(?:\b(?:require|include)(?:_once)?\s*\(?|\bloadRoutesFrom\s*\(|->\s*group\s*\(|\bapi\s*:\s*\[?)\s*$"
 )
+_ONCE_LEAD = re.compile(r"\b(?:require|include)_once\s*\(?\s*$")
+# Mounts in test code (a test that requires routes/api.php) don't count.
+_TEST_DIRS = frozenset({"test", "tests", "spec", "specs", "__tests__", "testing"})
+_TEST_FILE = re.compile(r"(?:Test|_test|\.test|Spec)\.php$")
 _API_ARG = re.compile(r"\bapi\s*:\s*")
 # Mount references and withRouting calls read per file.
 MAX_MOUNT_REFS = 512
@@ -147,6 +153,8 @@ class Mount:
 
     target: str
     groups: list[LaravelGroup] | None
+    # `require_once` / `include_once`: a no-op when the file is already loading.
+    once: bool = False
 
 
 @dataclass
@@ -251,11 +259,11 @@ def _group_from(links: list[ra.Link], group: ra.Link, content: str) -> LaravelGr
         attrs_open, attrs_close = span
         attrs_end = min(attrs_close, attrs_open + ra._ARG_SCAN)
         ra.add_group_attr_middleware(scope, content[attrs_open + 1 : attrs_end])
-        read: set[str] = set()
+        # PHP keeps the last of duplicate keys; only that one is read.
+        last: dict[str, re.Match] = {}
         for attr in _GROUP_ATTR.finditer(content, attrs_open + 1, attrs_end):
-            if attr.group(1) in read:
-                continue  # the first `'prefix' =>` / `'controller' =>` counts
-            read.add(attr.group(1))
+            last[attr.group(1)] = attr
+        for attr in sorted(last.values(), key=lambda m: m.start()):
             value_end = _expr_end(content, attr.end(), attrs_close)
             if attr.group(1) == "prefix":
                 prefixes.append(_prefix_value(content, attr.end(), value_end))
@@ -404,8 +412,9 @@ def _statement_routes(
 def scan_file(content: str, relative: str) -> FileScan:
     """Registrations and route-file mounts in one PHP file."""
     scan = FileScan()
+    mounts_ok = not is_test_path(relative)
     if "Route::" not in content:
-        if "base_path" in content or "__DIR__" in content:
+        if mounts_ok and ("base_path" in content or "__DIR__" in content):
             # `$this->loadRoutesFrom(__DIR__.'/../routes/api.php')` outside
             # any group still claims the file (no default /api).
             scan.mounts = _mounts(content, relative, [])
@@ -463,7 +472,8 @@ def scan_file(content: str, relative: str) -> FileScan:
             action = action or _controller_action(content, args_open, group_controller)
             scan.routes.append(LaravelRoute(methods, uri, offset, scope, action, outer))
 
-    scan.mounts = _mounts(content, relative, groups)
+    if mounts_ok:
+        scan.mounts = _mounts(content, relative, groups)
     return scan
 
 
@@ -478,6 +488,11 @@ def _controller_action(content: str, args_open: int, controller: str | None) -> 
         return None
     match = _BARE_ACTION.match(content, args_open, args_open + 500)
     return (controller, match.group(1)) if match else None
+
+
+def is_test_path(relative: str) -> bool:
+    parts = relative.split("/")
+    return any(part.lower() in _TEST_DIRS for part in parts[:-1]) or bool(_TEST_FILE.search(parts[-1]))
 
 
 def _api_ranges(content: str) -> list[tuple[int, int, str]]:
@@ -540,7 +555,7 @@ def _mounts(content: str, relative: str, groups: list[LaravelGroup]) -> list[Mou
             if api is not None:
                 # `->withRouting(api: [__DIR__.'/../routes/api.php', ...], apiPrefix: 'api/v1')`.
                 outer.append(LaravelGroup(api[0], api[1], prefix=(LITERAL, api[2])))
-        mounts.append(Mount(target, outer))
+        mounts.append(Mount(target, outer, bool(_ONCE_LEAD.search(lead))))
     return mounts
 
 
@@ -562,53 +577,99 @@ def join_path(prefixes: list[Prefix], uri: str) -> str:
     return _join(prefixes, uri)
 
 
+def prefix_base(prefixes: list[Prefix]) -> str | None:
+    """The joined prefix (``/a/b``), or None when every prefix is empty;
+    ``join_base(prefix_base(p), uri) == join_path(p, uri)``."""
+    parts = [value.strip("/") if kind == LITERAL else DYNAMIC_SEGMENT for kind, value in prefixes]
+    parts = [part for part in parts if part]
+    return "/" + "/".join(parts) if parts else None
+
+
+def join_base(base: str | None, uri: str) -> str:
+    if base is None:
+        return uri if uri.startswith("/") else "/" + uri
+    tail = uri.strip("/")
+    return base + "/" + tail if tail else base
+
+
 class MountResolver:
     """The outer group chains each route file is loaded under.
 
-    ``sites[target]`` lists ``(source file, groups at the mount)``. A file no
-    one mounts is loaded at the root, except ``routes/api.php``, which
-    Laravel's default provider mounts under ``default_api`` (``/api``).
+    ``sites[target]`` lists ``(source file, groups at the mount, once)``. A
+    file no one mounts is loaded at the root, except ``routes/api.php``,
+    which Laravel's default provider mounts under ``default_api``
+    (``/api``).
 
-    Each target is resolved once (memoised at every depth), so the work is
-    linear in the mount edges times MAX_MOUNT_CHAINS. A target reached
-    again while it is being resolved (a cycle), past MAX_MOUNT_DEPTH, or
-    after MAX_MOUNT_VISITS edges have been followed is None (unresolved).
+    A mount that loops back to a file still being resolved closes a cycle:
+    if any mount on that cycle is ``require_once`` / ``include_once`` it is
+    a no-op (PHP skips the already-loaded file); otherwise the chain is
+    None (unresolved). A file mounted more than MAX_MOUNT_DEPTH levels below
+    a root is None. Results that depend on the in-progress path (cut by a
+    cycle, MAX_MOUNT_PATH or the MAX_MOUNT_VISITS edge budget) aren't
+    memoised, so the answer doesn't depend on which file is resolved first;
+    the budget bounds the total work.
     """
 
-    def __init__(self, sites: dict[str, list[tuple[str, list[LaravelGroup] | None]]], default_api: Prefix) -> None:
+    def __init__(
+        self, sites: dict[str, list[tuple[str, list[LaravelGroup] | None, bool]]], default_api: Prefix
+    ) -> None:
         self.sites = sites
         self.default_api = default_api
-        self._memo: dict[str, list[list[LaravelGroup] | None]] = {}
-        self._active: set[str] = set()
+        self._memo: dict[str, tuple[list[list[LaravelGroup] | None], int]] = {}
+        self._path: list[str] = []  # files being resolved, outermost first
+        self._edge_once: list[bool] = []  # once-ness of the mount from _path[i] to _path[i + 1]
         self._visits = 0
 
     def chains(self, target: str) -> list[list[LaravelGroup] | None]:
-        return self._chains(target, 0)
+        out, _, _ = self._chains(target)
+        # Loaded only through no-op `require_once` cycles: treat as a root.
+        return out or [[]]
 
-    def _chains(self, target: str, depth: int) -> list[list[LaravelGroup] | None]:
+    def _chains(self, target: str) -> tuple[list[list[LaravelGroup] | None], int, bool]:
+        """``(chains, height, truncated)``. ``height`` is the longest mount
+        path from a root, a property of the file itself, so the
+        MAX_MOUNT_DEPTH cut is memo-safe; ``truncated`` marks results cut by
+        the in-progress path or the budget, which aren't memoised."""
         if target in self._memo:
-            return self._memo[target]
+            chains, height = self._memo[target]
+            return chains, height, False
         sites = self.sites.get(target)
         if not sites:
             if target == "routes/api.php":
-                return [[LaravelGroup(-1, -1, prefix=self.default_api)]]
-            return [[]]
-        if depth >= MAX_MOUNT_DEPTH or target in self._active or self._visits >= MAX_MOUNT_VISITS:
-            return [None]
-        self._active.add(target)
+                return [[LaravelGroup(-1, -1, prefix=self.default_api)]], 0, False
+            return [[]], 0, False
+        if len(self._path) >= MAX_MOUNT_PATH or self._visits >= MAX_MOUNT_VISITS:
+            return [None], 0, True
+        self._path.append(target)
         out: list[list[LaravelGroup] | None] = []
-        for source, groups in sites:
+        height = 0
+        truncated = False
+        for source, groups, once in sites:
             self._visits += 1
             if self._visits > MAX_MOUNT_VISITS:
+                truncated = True
                 break
-            for parent in self._chains(source, depth + 1):
+            if source in self._path:
+                truncated = True
+                start = self._path.index(source)
+                if once or any(self._edge_once[start:]):
+                    continue  # a no-op re-include
+                parents: list[list[LaravelGroup] | None] = [None]
+            else:
+                self._edge_once.append(once)
+                parents, parent_height, cut = self._chains(source)
+                self._edge_once.pop()
+                truncated = truncated or cut
+                height = max(height, parent_height + 1)
+            for parent in parents:
                 chain = None if parent is None or groups is None else parent + groups
                 if not any(chain is other or chain == other for other in out):
                     out.append(chain)
                 if len(out) >= MAX_MOUNT_CHAINS:
                     break
-            if len(out) >= MAX_MOUNT_CHAINS:
-                break
-        self._active.discard(target)
-        self._memo[target] = out or [None]
-        return self._memo[target]
+        self._path.pop()
+        if height > MAX_MOUNT_DEPTH:
+            out = [None]  # mounted deeper than we follow
+        if not truncated:
+            self._memo[target] = (out, height)
+        return out, height, truncated

@@ -32,20 +32,22 @@ from . import route_auth as ra
 
 HTTP_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"})
 
-# Route config files Symfony loads on its own.
-ROUTE_CONFIG_FILES = (
-    "config/routes.yaml",
-    "config/routes.yml",
-    "config/routes.xml",
-    "app/config/routing.yml",
-    "app/config/routing.yaml",
-    "app/config/routing.xml",
-)
-ROUTE_CONFIG_DIRS = ("config/routes",)
+# Route config Symfony loads on its own, in the kernel's order
+# (MicroKernelTrait::configureRoutes): `config/routes/*.yaml` first, sorted,
+# then `config/routes.yaml` last, so the latter's imports win a route-name
+# collision. The kernel's glob is `*.{php,yaml}`: `.yml` / `.xml` files
+# there are only read when something imports them. Symfony 2/3's
+# `app/config/routing.*` comes from the framework config.
+ROUTE_CONFIG_DIR = "config/routes"
+ROUTE_CONFIG_DIR_SUFFIXES = (".yaml",)
+ROUTE_CONFIG_LAST = ("config/routes.yaml",)
+LEGACY_ROUTE_CONFIG_FILES = ("app/config/routing.yml", "app/config/routing.yaml", "app/config/routing.xml")
 ROUTE_CONFIG_SUFFIXES = (".yaml", ".yml", ".xml")
-# Imports followed this deep; files and entries read at most this many.
+# Imports followed this deep; files loaded and entries read at most this many.
 MAX_IMPORT_DEPTH = 4
 MAX_CONFIG_FILES = 64
+# Distinct prefixes (different route-name prefixes) per attribute route.
+MAX_PREFIXES = 8
 MAX_ENTRIES = 2000
 MAX_LINES = 20000
 
@@ -117,37 +119,48 @@ class ConfigRoute:
 
 @dataclass
 class RouteConfig:
-    # Keyed by (config file, entry line): a route file imported again
-    # replaces its routes, as Symfony's later import of the same route
-    # names does.
-    route_sets: dict[tuple[str, int], list[ConfigRoute]] = field(default_factory=dict)
-    # Attribute-controller imports, target -> prefix, in load order; a
-    # later import of the same target replaces the earlier one.
-    attribute_imports: dict[str, str] = field(default_factory=dict)
+    """Routes from config files, and the import prefixes of attribute
+    controllers.
+
+    Symfony keys routes by name: an import that re-adds a route name
+    replaces the earlier route. So an import of the same controllers or the
+    same route file with the same effective ``name_prefix`` replaces the
+    earlier one (the last in load order wins), while imports with different
+    name prefixes both stay live.
+    """
+
+    # (config file, entry line, name prefix) -> routes.
+    route_sets: dict[tuple[str, int, str], list[ConfigRoute]] = field(default_factory=dict)
+    # target (dir ending in "/", or file) -> name prefix -> (load order, path prefix).
+    imports_by_target: dict[str, dict[str, tuple[int, str]]] = field(default_factory=dict)
+    _order: int = 0
 
     @property
     def routes(self) -> list[ConfigRoute]:
         return [route for routes in self.route_sets.values() for route in routes]
 
-    def add_import(self, target: str, prefix: str) -> None:
-        self.attribute_imports.pop(target, None)
-        self.attribute_imports[target] = prefix
+    def add_import(self, target: str, prefix: str, name_prefix: str = "") -> None:
+        self._order += 1
+        self.imports_by_target.setdefault(target, {})[name_prefix] = (self._order, prefix)
 
-    def prefix_for(self, file: str) -> str:
-        """The import prefix for attribute routes in ``file``: the most
-        specific import covering it (the last one, for equal targets).
-        A prefix that couldn't be read is a ``{prefix}`` segment."""
-        best: str | None = None
-        for target in self.attribute_imports:
-            if _covers(target, file) and (best is None or len(target) >= len(best)):
-                best = target
-        return self.attribute_imports[best] if best is not None else ""
-
-
-def _covers(target: str, file: str) -> bool:
-    if target.endswith("/"):
-        return file.startswith(target) or target == "./"
-    return file == target
+    def prefixes_for(self, file: str) -> list[str]:
+        """Import prefixes for attribute routes in ``file``: for each name
+        prefix, the last import (in load order) covering the file. A prefix
+        that couldn't be read is a ``{prefix}`` segment. Looks up the file
+        and each ancestor directory, so it's O(path depth)."""
+        if not self.imports_by_target:
+            return [""]
+        parts = file.split("/")
+        candidates = ["./", file] + ["/".join(parts[:i]) + "/" for i in range(1, len(parts))]
+        latest: dict[str, tuple[int, str]] = {}
+        for target in candidates:
+            for name_prefix, (order, prefix) in self.imports_by_target.get(target, {}).items():
+                if name_prefix not in latest or order > latest[name_prefix][0]:
+                    latest[name_prefix] = (order, prefix)
+        if not latest:
+            return [""]
+        ordered = sorted(latest.values())
+        return list(dict.fromkeys(prefix for _, prefix in ordered))[:MAX_PREFIXES]
 
 
 @dataclass
@@ -294,7 +307,7 @@ def parse_xml_entries(text: str) -> list[_Entry]:
             values = {k: v for k, v in attrs.items() if k in ("path", "methods", "controller")}
             nested = set() if "path" in attrs else {"path"}  # <path locale="..."> children
         else:
-            values = {k: v for k, v in attrs.items() if k in ("resource", "prefix", "type")}
+            values = {k: v for k, v in attrs.items() if k in ("resource", "prefix", "type", "name-prefix")}
             nested = set()
         entries.append(_Entry(attrs.get("id", ""), line_of(text, match.start()), values, nested))
         if len(entries) >= MAX_ENTRIES:
@@ -324,27 +337,34 @@ def load_route_config(read, list_dir) -> RouteConfig:
     missing); ``list_dir(relative) -> list[str]`` lists a directory's files
     (repo-relative). Kept I/O-free so it can be fuzzed directly."""
     config = RouteConfig()
-    roots = list(ROUTE_CONFIG_FILES)
-    for directory in ROUTE_CONFIG_DIRS:
-        roots += sorted(f for f in list_dir(directory) if f.endswith(ROUTE_CONFIG_SUFFIXES))
-    seen: set[tuple[str, str]] = set()
+    roots = sorted(f for f in list_dir(ROUTE_CONFIG_DIR) if f.endswith(ROUTE_CONFIG_DIR_SUFFIXES))
+    roots += [*ROUTE_CONFIG_LAST, *LEGACY_ROUTE_CONFIG_FILES]
+    parsed: dict[str, list[_Entry] | None] = {}
+    loads = 0
 
-    def load(relative: str, prefix: str, depth: int) -> None:
-        if len(seen) >= MAX_CONFIG_FILES or depth > MAX_IMPORT_DEPTH:
+    def entries_of(relative: str) -> list[_Entry] | None:
+        if relative not in parsed:
+            text = read(relative)
+            if text is None:
+                parsed[relative] = None
+            else:
+                parsed[relative] = parse_xml_entries(text) if relative.endswith(".xml") else parse_yaml_entries(text)
+        return parsed[relative]
+
+    def load(relative: str, prefix: str, name_prefix: str, depth: int) -> None:
+        # Loaded again on a re-import (a later import wins), up to the cap.
+        nonlocal loads
+        if loads >= MAX_CONFIG_FILES or depth > MAX_IMPORT_DEPTH:
             return
-        key = (relative, prefix)
-        if key in seen:
+        loads += 1
+        entries = entries_of(relative)
+        if entries is None:
             return
-        seen.add(key)
-        text = read(relative)
-        if text is None:
-            return
-        entries = parse_xml_entries(text) if relative.endswith(".xml") else parse_yaml_entries(text)
         base_dir = posixpath.dirname(relative)
         for entry in entries:
             values = entry.values
             if "resource" in values or "resource" in entry.nested:
-                _import(entry, base_dir, prefix, depth)
+                _import(entry, base_dir, prefix, name_prefix, depth)
                 continue
             if "path" in entry.nested or "path" not in values:
                 continue  # localized path map, or not a route
@@ -353,11 +373,11 @@ def load_route_config(read, list_dir) -> RouteConfig:
                 path = "/" + path
             methods = _methods(_unquote(values.get("methods", ""))) or ["ANY"]
             full = import_prefix(prefix, path)
-            config.route_sets[(relative, entry.line)] = [
-                ConfigRoute(method, full, relative, entry.line) for method in methods
-            ]
+            key = (relative, entry.line, name_prefix)
+            config.route_sets.pop(key, None)
+            config.route_sets[key] = [ConfigRoute(method, full, relative, entry.line) for method in methods]
 
-    def _import(entry: _Entry, base_dir: str, prefix: str, depth: int) -> None:
+    def _import(entry: _Entry, base_dir: str, prefix: str, name_prefix: str, depth: int) -> None:
         values = entry.values
         resource = values.get("resource") or values.get("resource.path")
         if resource is None:
@@ -376,21 +396,22 @@ def load_route_config(read, list_dir) -> RouteConfig:
         else:
             own = _unquote(values.get("prefix", ""))
         combined = _join_prefix(prefix, own)
+        names = name_prefix + _unquote(values.get("name_prefix", values.get("name-prefix", "")))
         kind = _unquote(values.get("type", ""))
         if resource == "routing.controllers":
             # Symfony 7.1+: every attribute-routed controller (src/).
-            config.add_import("src/", combined)
+            config.add_import("src/", combined, names)
             return
         target = _resolve(base_dir, resource)
         if target is None:
             return
         if target.endswith(ROUTE_CONFIG_SUFFIXES) and kind not in ("attribute", "annotation"):
-            load(target, combined, depth + 1)
+            load(target, combined, names, depth + 1)
         elif kind in ("attribute", "annotation") or target.endswith("/") or target.endswith(".php"):
-            config.add_import(target, combined)
+            config.add_import(target, combined, names)
 
     for relative in roots:
-        load(relative, "", 0)
+        load(relative, "", "", 0)
     return config
 
 
@@ -398,4 +419,3 @@ def _join_prefix(outer: str, inner: str) -> str:
     inner = inner.strip().strip("/")
     outer = outer.strip().rstrip("/")
     return f"{outer}/{inner}" if inner else outer
-

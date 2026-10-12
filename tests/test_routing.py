@@ -313,6 +313,84 @@ def test_many_mount_refs_and_with_routing_calls_stay_fast(tmp_path: Path) -> Non
     assert time.perf_counter() - start < 5.0
 
 
+@pytest.mark.parametrize("provider", ["app/Providers/RouteServiceProvider.php", "routes/0_provider.php", "routes/z_provider.php"])
+def test_require_once_cycle_is_a_no_op_whatever_the_file_order(tmp_path: Path, provider: str) -> None:
+    _write(
+        tmp_path,
+        {
+            provider: (
+                "<?php\nRoute::prefix('p')->middleware('auth')->group(function () {\n"
+                "    require base_path('routes/a.php');\n});\n"
+            ),
+            "routes/a.php": (
+                "<?php\nRoute::get('/ax', fn () => 1);\n"
+                "Route::prefix('b')->group(function () {\n    require base_path('routes/b.php');\n});\n"
+            ),
+            "routes/b.php": "<?php\nrequire_once base_path('routes/a.php');\nRoute::get('/bx', fn () => 1);\n",
+        },
+    )
+    routes = _routes(tmp_path)
+    assert set(routes) == {"GET /p/ax", "GET /p/b/bx"}
+    assert all(r.auth == "required" for r in routes.values())
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_mounts_deeper_than_the_bound_are_unresolved(tmp_path: Path, reverse: bool) -> None:
+    # f0 -> f1 -> ... -> f10: f8 is 8 mounts below the root, f9 is 9.
+    names = [f"f{i:02d}" for i in range(11)]
+    if reverse:
+        names = [f"z{9 - i:02d}" for i in range(11)]  # other file order
+    files = {}
+    for i, name in enumerate(names):
+        mount = f"Route::prefix('{name}')->group(base_path('routes/{names[i + 1]}.php'));\n" if i + 1 < len(names) else ""
+        files[f"routes/{name}.php"] = f"<?php\n{mount}Route::get('/x{i}', fn () => 1);\n"
+    _write(tmp_path, files)
+    paths = {key.split(" ", 1)[1] for key in _routes(tmp_path)}
+    assert "/" + "/".join(names[:8]) + "/x8" in paths
+    assert "/{prefix}/x9" in paths and "/{prefix}/x10" in paths
+
+
+def test_test_files_do_not_mount_route_files(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "routes/api.php": "<?php\nRoute::get('/user', fn () => 1);\n",
+            "tests/Feature/RoutesTest.php": "<?php\nrequire base_path('routes/api.php');\n",
+        },
+    )
+    assert list(_routes(tmp_path)) == ["GET /api/user"]
+
+
+def test_duplicate_prefix_keys_keep_the_last(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {"routes/web.php": "<?php\nRoute::group(['prefix' => 'a', 'prefix' => 'b'], function () {\n    Route::get('/x', fn () => 1);\n});\n"},
+    )
+    assert list(_routes(tmp_path)) == ["GET /b/x"]
+
+
+def test_many_routes_under_deep_groups_and_many_mounts_stay_fast(tmp_path: Path) -> None:
+    depth = 30
+    # Each group names 60 distinct auth guards. (Most of the remaining time
+    # is core redacting each Route's guard_evidence.)
+    body = "".join(
+        "Route::prefix('g')->middleware([" + ", ".join(f"'auth:g{d}x{k}'" for k in range(60)) + "])->group(function () {\n"
+        for d in range(depth)
+    ) + (
+        "".join(f"Route::get('/r{i}', [C::class, 'm{i}']);\n" for i in range(2500))
+        + "});\n" * depth
+    )
+    files = {"routes/big.php": "<?php\n" + body}  # ~0.3 MB
+    for i in range(8):
+        files[f"app/Providers/P{i}.php"] = f"<?php\nRoute::prefix('m{i}')->group(base_path('routes/big.php'));\n"
+    _write(tmp_path, files)
+    start = time.perf_counter()
+    routes = PhpWebAnalyzer().analyze(tmp_path).routes
+    assert time.perf_counter() - start < 5.0
+    assert len(routes) == 8 * 2500
+    assert routes[0].auth == "required"
+
+
 def test_singular_and_resource_expansion() -> None:
     assert [lr.singular(w) for w in ("photos", "categories", "boxes", "news-items", "status")] == [
         "photo",
@@ -447,6 +525,84 @@ def test_repeated_imports_of_the_same_target_keep_the_last_prefix(tmp_path: Path
     assert all(key.startswith("GET /last/a") for key in attribute)
     legacy = [key for key, r in routes.items() if r.file == "config/legacy.yaml"]
     assert len(legacy) == 1
+
+
+def test_kernel_loads_config_routes_dir_before_routes_yaml(tmp_path: Path) -> None:
+    # MicroKernelTrait imports config/routes/*.yaml first and routes.yaml
+    # last, so routes.yaml's un-prefixed import of the same controllers wins.
+    _write(
+        tmp_path,
+        {
+            "config/routes.yaml": "controllers:\n    resource: ../src/Controller/\n    type: attribute\n",
+            "config/routes/annotations.yaml": (
+                "admin:\n    resource: ../../src/Controller/\n    type: attribute\n    prefix: /admin\n"
+            ),
+            "config/routes/ignored.xml": '<routes><route id="x" path="/from-xml"/></routes>',
+            "config/routes/ignored.yml": "y:\n    path: /from-yml\n",
+            "config/packages/security.yaml": "security:\n    access_control:\n        - { path: ^/admin, roles: ROLE_ADMIN }\n",
+            "src/Controller/Users.php": "<?php\nclass Users {\n    #[Route('/users', methods: ['GET'])]\n    public function list() {}\n}\n",
+        },
+    )
+    routes = _routes(tmp_path)
+    assert set(routes) == {"GET /users"}
+    assert routes["GET /users"].auth == "unknown"
+
+
+def test_imports_with_different_name_prefixes_both_register(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "config/routes.yaml": (
+                "v1:\n    resource: ../src/Controller/\n    type: attribute\n    prefix: /v1\n    name_prefix: v1_\n"
+                "v2:\n    resource: ../src/Controller/\n    type: attribute\n    prefix: /v2\n    name_prefix: v2_\n"
+                "v3:\n    resource: ../src/Controller/\n    type: attribute\n    prefix: /v3\n    name_prefix: v2_\n"
+                "legacy:\n    resource: legacy.xml\n"
+            ),
+            "config/legacy.xml": (
+                '<routes><import resource="old.yaml" prefix="/a" name-prefix="a_"/>'
+                '<import resource="old.yaml" prefix="/b" name-prefix="b_"/></routes>'
+            ),
+            "config/old.yaml": "old:\n    path: /old\n",
+            "src/Controller/Items.php": "<?php\nclass Items {\n    #[Route('/items', methods: ['GET'])]\n    public function list() {}\n}\n",
+        },
+    )
+    # v3 replaces v2 (same name prefix); v1 stays.
+    assert set(_routes(tmp_path)) == {"GET /v1/items", "GET /v3/items", "ANY /a/old", "ANY /b/old"}
+
+
+def test_last_import_wins_across_nested_targets(tmp_path: Path) -> None:
+    # Same (empty) name prefix: the later import of src/Controller/ replaces
+    # the earlier routing.controllers (src/) one for the same routes.
+    _write(
+        tmp_path,
+        {
+            "config/routes.yaml": (
+                "all:\n    resource: routing.controllers\n    prefix: /b\n"
+                "controllers:\n    resource: ../src/Controller/\n    type: attribute\n    prefix: /a\n"
+            ),
+            "src/Controller/A.php": "<?php\nclass A {\n    #[Route('/x', methods: ['GET'])]\n    public function x() {}\n}\n",
+        },
+    )
+    assert set(_routes(tmp_path)) == {"GET /a/x"}
+
+
+def test_many_controllers_and_imports_stay_fast(tmp_path: Path) -> None:
+    # 16 auto-loaded files x 2000 distinct import targets (32k imports),
+    # and 2000 controllers covered by the last file's imports.
+    files = {
+        f"config/routes/r{j:02d}.yaml": "".join(
+            f"c{i}:\n    resource: ../../src/{'C' if j == 15 else f'D{j}_'}{i}/\n    type: attribute\n    prefix: /p{i}\n"
+            for i in range(2000)
+        )
+        for j in range(16)
+    }
+    for i in range(2000):
+        files[f"src/C{i}/A.php"] = f"<?php\nclass A{i} {{\n    #[Route('/a', methods: ['GET'])]\n    public function a() {{}}\n}}\n"
+    _write(tmp_path, files)
+    start = time.perf_counter()
+    routes = _routes(tmp_path)
+    assert time.perf_counter() - start < 3.0
+    assert len(routes) == 2000 and "GET /p1999/a" in routes
 
 
 def test_localized_import_prefix_is_a_placeholder(tmp_path: Path) -> None:
