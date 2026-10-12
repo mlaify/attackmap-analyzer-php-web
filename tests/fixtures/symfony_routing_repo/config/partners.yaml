@@ -1,0 +1,4 @@
+partner_sync:
+    path: /sync
+    methods: POST
+    controller: App\Partner\SyncController

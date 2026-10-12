@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Laravel and Symfony route paths (#3)
+
+- **Laravel resources and `match`.** `Route::resource` / `apiResource` (and `Route::resources([...])` / `apiResources`) expand to their REST routes, so `Route::resource('photos', ...)` yields `DELETE /photos/{photo}` and the rest. `->only()` / `->except()` / `->shallow()`, an `['only' => ...]` options array and nested `photos.comments` names are honoured, and each action is matched to the controller's constructor middleware. Array-first `Route::match(['get', 'post'], '/x')` and Slim `$app->map(['GET'], '/x')` now produce one route per method.
+- **Laravel group prefixes.** `Route::prefix('admin')->middleware(...)->group(fn)` and `Route::group(['prefix' => ..., 'middleware' => ...], fn)` join their prefixes onto the routes inside, and a scope chained before the verb (`Route::middleware('auth:sanctum')->get('/user', ...)`) applies to that route. `Route::controller(C::class)->group(...)` maps bare `'method'` actions to `C` for constructor-middleware resolution.
+- **Route-file mounts and `/api`.** A route file inherits the prefix and middleware of the group that loads it (`->group(base_path('routes/admin.php'))`, `require` / `loadRoutesFrom(...)` inside a group, `withRouting(api: ..., apiPrefix: ...)`). `routes/api.php` defaults to `/api` when nothing mounts it. `config('cashier.path')`-style prefixes are read from `config/*.php` (literal or `env()` default); other dynamic prefixes become a `{prefix}` segment rather than a wrong path. Mount chains are followed 8 deep with cycle detection.
+- **Slim / Lumen group prefixes.** `$app->group('/billing', ...)` and `$router->group(['prefix' => 'api'], ...)` prefixes are joined (`POST /billing/invoices`, not `POST /invoices`).
+- **Symfony class prefixes and route config.** A class-level `#[Route('/blog')]` is joined onto every action (methods merged) and is no longer reported as a route of its own, except on an invokable controller. `#[Route(path: ...)]`, a fully qualified `Route`, and grouped attributes (`#[Route('/profile'), IsGranted('ROLE_USER')]`) are read. `config/routes.yaml`, `config/routes/*.yaml` / `*.xml` and `app/config/routing.yml` routes are extracted, and `resource` imports carry their `prefix` onto attribute controllers (`routing.controllers`, `../src/Controller/`) and imported route files. `access_control` is now matched against the joined path.
+
+### Fixed
+
+- A `#[` inside a comment or string stopped attribute scanning for the rest of the file, so later `#[IsGranted]` guards were lost (symfony/demo's admin edit/delete actions were `unknown`).
+- Commented-out `Route::get(...)` calls are no longer routes, heredoc/nowdoc bodies no longer desynchronise bracket matching, and a comment between chained calls (`->middleware('api') // ... ->group(...)`) no longer ends the chain.
+- Route de-duplication is a dict lookup instead of a scan of every route so far.
+
 ### Added — route-level auth (#8, AttackMap#256)
 
 - **Routes carry their auth in the core contract.** `Route.auth` is `required`, `anonymous` or `unknown`, with `guards` naming the control and `guard_evidence` quoting the source text. AttackMap ≥ 0.6 trusts it over its ±40-line auth-hint window, which can't see PHP guards and let one guarded route mask its neighbours. Older cores ignore the fields, and the `auth_middleware` hint is kept for one release.

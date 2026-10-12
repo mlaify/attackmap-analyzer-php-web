@@ -1,0 +1,4 @@
+security:
+    access_control:
+        - { path: ^/app/reports, roles: ROLE_ANALYST }
+        - { path: ^/legacy, roles: ROLE_ADMIN }

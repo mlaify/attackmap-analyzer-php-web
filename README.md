@@ -47,10 +47,15 @@ A `src/`, `app/` or `config/` directory on its own is not enough, since Python, 
 
 Route extraction currently includes patterns such as:
 
-- `Route::get(...)`/`Route::post(...)` style calls
-- `$app->get('/path', ...)` style calls. The path must start with `/`, and the receiver must be `$app`, `$router`, `$route`, `$group` or `$r`, a variable assigned from `AppFactory::create()` / `new RouteCollector` / `new App`, or a parameter typed `RouteCollectorProxy` / `RouteCollector` / `App`. This keeps `$request->get('id')` and `$cache->get('k')` out.
-- PHP attributes like `#[Route("/path", methods: ["GET"]) ]`
+- Laravel `Route::get|post|put|patch|delete|options|head|any(...)`, array-first `Route::match(['get', 'post'], ...)`, and a scope chained before the verb (`Route::middleware('auth')->get(...)`). `Route::resource` / `apiResource` / `resources` / `apiResources` expand to their REST routes (7 / 5 actions; `update` is `PUT` and `PATCH`), honouring `->only()` / `->except()` / `->shallow()`, an `['only' => ...]` options array and nested `photos.comments` names.
+- Laravel groups: `Route::prefix('admin')->middleware(...)->group(function () { ... })` and `Route::group(['prefix' => ..., 'middleware' => ...], fn)` join their prefixes onto the routes inside, at any nesting depth up to 32. `Route::controller(C::class)->group(...)` dispatches bare method names to `C`.
+- Laravel route files take the prefix and middleware of the group that loads them: `->group(base_path('routes/admin.php'))`, `require base_path(...)` / `$this->loadRoutesFrom(__DIR__.'/...')` inside a group, and `withRouting(api: ..., apiPrefix: ...)` in `bootstrap/app.php`. `routes/api.php` defaults to `/api` when nothing mounts it. A `config('file.key')` prefix is read from `config/file.php` (a literal or an `env()` default), and any other non-literal prefix becomes a `{prefix}` segment.
+- `$app->get('/path', ...)` / `$app->map(['GET', 'POST'], '/path', ...)` Slim calls. The path must start with `/`, and the receiver must be `$app`, `$router`, `$route`, `$group` or `$r`, a variable assigned from `AppFactory::create()` / `new RouteCollector` / `new App`, or a parameter typed `RouteCollectorProxy` / `RouteCollector` / `App`. This keeps `$request->get('id')` and `$cache->get('k')` out. Slim `$app->group('/v1', ...)` and Lumen `$router->group(['prefix' => 'api'], ...)` prefixes are joined.
+- Symfony `#[Route('/path', methods: ['GET'])]` (or `path:`) attributes, joined onto the class-level `#[Route('/prefix')]` (whose `methods` merge in). A class-level route is a route of its own only on a controller with no routed actions (`__invoke`).
+- Symfony route config: `config/routes.yaml`, `config/routes/*.yaml` / `*.xml` and `app/config/routing.yml` `path` / `methods` entries, and `resource` imports with a `prefix`, applied to attribute controllers under the imported directory (or `routing.controllers`, i.e. `src/`) or to an imported local route file. Localized path maps and `when@dev` / `when@test` blocks are skipped.
 - config-style `"path" => "/..."`, only in files that also declare a `'routes'` / `'router'` key (so Laravel's `config/logging.php` paths aren't routes)
+
+Brackets are matched in one string-, comment- and heredoc-aware pass per file, so a commented-out `Route::get(...)` is not a route and a `}` inside a string doesn't end a group.
 
 Each route carries `auth`, `guards` and `guard_evidence` (AttackMap#256):
 
@@ -60,7 +65,7 @@ Each route carries `auth`, `guards` and `guard_evidence` (AttackMap#256):
 | `anonymous` | Laravel `->withoutMiddleware('auth')` on the route or a group, or a controller `->except([...])` naming the action; Symfony `#[IsGranted('PUBLIC_ACCESS')]` or an `access_control` rule granting `PUBLIC_ACCESS` — when nothing else requires auth |
 | `unknown` | anything else |
 
-`access_control` is only applied to rules with literal `^/prefix` paths. A rule with `ips`, `host`, `allow_if` or a regex path stops resolution for the routes after it, and routes under a class-level `#[Route]` prefix are skipped. Laravel 11 `HasMiddleware::middleware()` controllers, Slim app-wide `$app->add(...)` and `can:` middleware aren't resolved.
+`access_control` is only applied to rules with literal `^/prefix` paths. A rule with `ips`, `host`, `allow_if` or a regex path stops resolution for the routes after it. Rules are matched against the full path (class and import prefixes joined); attribute routes under an import prefix that can't be read (a localized prefix map) are skipped. Laravel 11 `HasMiddleware::middleware()` controllers, Slim app-wide `$app->add(...)` and `can:` middleware aren't resolved.
 
 Outbound calls currently include patterns such as:
 
@@ -105,7 +110,8 @@ This repository does not implement core-side discovery logic.
 ## Limitations
 
 - regex-based extraction (not AST)
-- limited config route parsing
+- limited config route parsing; the Symfony YAML/XML readers cover the shapes Symfony's docs and recipes use, not full YAML/XML
+- Laravel route names (`->name()` / `'as'`), `Route::view` / `Route::redirect` / `Route::singleton`, and resource `->parameters([...])` renames aren't modelled
 - no framework-specific deep parsing yet
 - no dataflow or reachability modeling inside this analyzer
 
