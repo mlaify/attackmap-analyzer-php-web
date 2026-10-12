@@ -644,10 +644,11 @@ class MountResolver:
         out: list[list[LaravelGroup] | None] = []
         height = 0
         truncated = False
+        exhausted = False
         for source, groups, once in sites:
             self._visits += 1
             if self._visits > MAX_MOUNT_VISITS:
-                truncated = True
+                truncated = exhausted = True
                 break
             if source in self._path:
                 truncated = True
@@ -668,6 +669,13 @@ class MountResolver:
                 if len(out) >= MAX_MOUNT_CHAINS:
                     break
         self._path.pop()
+        if not out and not exhausted and all(once for _, _, once in sites):
+            # Every loader is a `require_once` that yields nothing (a no-op
+            # re-include): the file was loaded first by something we don't
+            # see as a mount (the framework, `withRouting(web: ...)`), so
+            # it is a root. A plain `require` that only closes a cycle
+            # still contributes nothing.
+            out = [[]]
         if height > MAX_MOUNT_DEPTH:
             out = [None]  # mounted deeper than we follow
         if not truncated:

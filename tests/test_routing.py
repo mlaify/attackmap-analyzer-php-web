@@ -350,6 +350,54 @@ def test_mounts_deeper_than_the_bound_are_unresolved(tmp_path: Path, reverse: bo
     assert "/{prefix}/x9" in paths and "/{prefix}/x10" in paths
 
 
+@pytest.mark.parametrize("legacy", ["routes/legacy.php", "routes/0legacy.php"])
+def test_root_file_in_a_require_once_cycle_keeps_its_root_chain(tmp_path: Path, legacy: str) -> None:
+    # web.php is loaded by the framework (withRouting `web:` isn't a group);
+    # legacy.php's `require_once` of it is a no-op, so web.php stays a root
+    # and public.php is served both at the root and under the auth group.
+    _write(
+        tmp_path,
+        {
+            "bootstrap/app.php": (
+                "<?php\nreturn Application::configure(basePath: dirname(__DIR__))\n"
+                "    ->withRouting(web: __DIR__.'/../routes/web.php')->create();\n"
+            ),
+            "routes/web.php": (
+                "<?php\nRoute::get('/home', fn () => 1);\n"
+                f"require base_path('{legacy}');\n"
+                "require base_path('routes/public.php');\n"
+                "Route::middleware('auth')->prefix('admin')->group(function () {\n"
+                "    require base_path('routes/public.php');\n});\n"
+            ),
+            legacy: "<?php\nrequire_once base_path('routes/web.php');\nRoute::get('/legacy', fn () => 1);\n",
+            "routes/public.php": "<?php\nRoute::get('/status', fn () => 1);\n",
+        },
+    )
+    routes = _routes(tmp_path)
+    assert set(routes) == {"GET /home", "GET /legacy", "GET /status", "GET /admin/status"}
+    assert routes["GET /status"].auth == "unknown"
+    assert routes["GET /admin/status"].auth == "required"
+
+
+def test_public_file_keeps_root_chain_when_its_root_loader_is_in_a_once_cycle(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "bootstrap/app.php": "<?php\n->withRouting(web: __DIR__.'/../routes/web.php');\n",
+            "routes/web.php": "<?php\nrequire base_path('routes/legacy.php');\nrequire base_path('routes/public.php');\n",
+            "routes/legacy.php": "<?php\nrequire_once base_path('routes/web.php');\n",
+            "routes/public.php": "<?php\nRoute::get('/status', fn () => 1);\n",
+            "app/Providers/AdminRoutes.php": (
+                "<?php\nRoute::middleware('auth')->prefix('admin')->group(function () {\n"
+                "    require base_path('routes/public.php');\n});\n"
+            ),
+        },
+    )
+    routes = _routes(tmp_path)
+    assert set(routes) == {"GET /status", "GET /admin/status"}
+    assert (routes["GET /status"].auth, routes["GET /admin/status"].auth) == ("unknown", "required")
+
+
 def test_test_files_do_not_mount_route_files(tmp_path: Path) -> None:
     _write(
         tmp_path,
@@ -568,6 +616,45 @@ def test_imports_with_different_name_prefixes_both_register(tmp_path: Path) -> N
     )
     # v3 replaces v2 (same name prefix); v1 stays.
     assert set(_routes(tmp_path)) == {"GET /v1/items", "GET /v3/items", "ANY /a/old", "ANY /b/old"}
+
+
+def test_many_distinct_name_prefixes_stay_bounded(tmp_path: Path) -> None:
+    # 60 auto-loaded files x 2000 imports of one directory, each with its
+    # own name prefix: 120k live imports in Symfony, capped here.
+    files = {
+        f"config/routes/r{j:02d}.yaml": "".join(
+            f"c{i}:\n    resource: ../../src/Controller/\n    type: attribute\n"
+            f"    prefix: /p{j}_{i}\n    name_prefix: n{j}_{i}_\n"
+            for i in range(2000)
+        )
+        for j in range(60)
+    }
+    for i in range(1000):
+        files[f"src/Controller/C{i}.php"] = f"<?php\nclass C{i} {{\n    #[Route('/c{i}', methods: ['GET'])]\n    public function c() {{}}\n}}\n"
+    _write(tmp_path, files)
+    start = time.perf_counter()
+    routes = _routes(tmp_path)
+    assert time.perf_counter() - start < 10.0
+    # Each route is reported under the MAX_PREFIXES most recent imports.
+    assert len(routes) == 1000 * sf.MAX_PREFIXES
+    assert "GET /p59_1999/c0" in routes
+
+
+def test_prefix_cap_keeps_the_most_recent_imports_across_targets(tmp_path: Path) -> None:
+    cap = sf.MAX_PREFIXES
+    early = "".join(f"a{i}:\n    resource: routing.controllers\n    prefix: /a{i}\n    name_prefix: a{i}_\n" for i in range(cap))
+    late = "".join(
+        f"b{i}:\n    resource: ../src/Controller/\n    type: attribute\n    prefix: /b{i}\n    name_prefix: b{i}_\n"
+        for i in range(cap)
+    )
+    _write(
+        tmp_path,
+        {
+            "config/routes.yaml": early + late,
+            "src/Controller/A.php": "<?php\nclass A {\n    #[Route('/x', methods: ['GET'])]\n    public function x() {}\n}\n",
+        },
+    )
+    assert set(_routes(tmp_path)) == {f"GET /b{i}/x" for i in range(cap)}
 
 
 def test_last_import_wins_across_nested_targets(tmp_path: Path) -> None:

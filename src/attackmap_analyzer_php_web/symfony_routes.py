@@ -140,8 +140,14 @@ class RouteConfig:
         return [route for routes in self.route_sets.values() for route in routes]
 
     def add_import(self, target: str, prefix: str, name_prefix: str = "") -> None:
+        """Record an import. Each target keeps the MAX_PREFIXES most recent
+        name prefixes (dict order is recency), so a lookup stays bounded."""
         self._order += 1
-        self.imports_by_target.setdefault(target, {})[name_prefix] = (self._order, prefix)
+        entries = self.imports_by_target.setdefault(target, {})
+        entries.pop(name_prefix, None)
+        entries[name_prefix] = (self._order, prefix)
+        if len(entries) > MAX_PREFIXES:
+            del entries[next(iter(entries))]
 
     def prefixes_for(self, file: str) -> list[str]:
         """Import prefixes for attribute routes in ``file``: for each name
@@ -160,7 +166,8 @@ class RouteConfig:
         if not latest:
             return [""]
         ordered = sorted(latest.values())
-        return list(dict.fromkeys(prefix for _, prefix in ordered))[:MAX_PREFIXES]
+        # The most recent imports, oldest first.
+        return list(dict.fromkeys(prefix for _, prefix in ordered))[-MAX_PREFIXES:]
 
 
 @dataclass
