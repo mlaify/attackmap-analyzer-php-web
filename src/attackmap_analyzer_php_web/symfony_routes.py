@@ -13,9 +13,11 @@
 
 The YAML and XML readers are line/tag scanners, not full parsers: they read
 the shapes Symfony's docs and recipes use and skip anything else (localized
-path maps, ``when@dev`` blocks, bundle ``@`` resources), so an unread prefix
-never turns into a wrong path silently: routes it may cover are marked
-uncertain and access_control isn't resolved for them.
+path maps, ``when@dev`` blocks, bundle ``@`` resources). A prefix that can't
+be read (a localized prefix map) becomes a ``{prefix}`` segment rather than a
+wrong path, and access_control isn't resolved for those routes. Symfony keys
+routes by name, so a later import of the same controllers or route file
+replaces the earlier one: each route is emitted once, under the last prefix.
 """
 
 from __future__ import annotations
@@ -114,28 +116,32 @@ class ConfigRoute:
 
 
 @dataclass
-class AttributeImport:
-    target: str  # repo-relative directory (ending in "/") or file
-    prefix: str | None  # None: a prefix we couldn't read
-
-
-@dataclass
 class RouteConfig:
-    routes: list[ConfigRoute] = field(default_factory=list)
-    attribute_imports: list[AttributeImport] = field(default_factory=list)
+    # Keyed by (config file, entry line): a route file imported again
+    # replaces its routes, as Symfony's later import of the same route
+    # names does.
+    route_sets: dict[tuple[str, int], list[ConfigRoute]] = field(default_factory=dict)
+    # Attribute-controller imports, target -> prefix, in load order; a
+    # later import of the same target replaces the earlier one.
+    attribute_imports: dict[str, str] = field(default_factory=dict)
 
-    def prefixes_for(self, file: str) -> tuple[list[str], bool]:
-        """Import prefixes for attribute routes in ``file`` and whether they
-        are certain. The most specific import wins (a later import of the
-        same controllers overrides an earlier one by route name)."""
-        matches = [imp for imp in self.attribute_imports if _covers(imp.target, file)]
-        if not matches:
-            return [""], True
-        longest = max(len(imp.target) for imp in matches)
-        best = [imp for imp in matches if len(imp.target) == longest]
-        prefixes = list(dict.fromkeys(imp.prefix for imp in best if imp.prefix is not None))
-        certain = all(imp.prefix is not None for imp in matches)
-        return prefixes or [""], certain
+    @property
+    def routes(self) -> list[ConfigRoute]:
+        return [route for routes in self.route_sets.values() for route in routes]
+
+    def add_import(self, target: str, prefix: str) -> None:
+        self.attribute_imports.pop(target, None)
+        self.attribute_imports[target] = prefix
+
+    def prefix_for(self, file: str) -> str:
+        """The import prefix for attribute routes in ``file``: the most
+        specific import covering it (the last one, for equal targets).
+        A prefix that couldn't be read is a ``{prefix}`` segment."""
+        best: str | None = None
+        for target in self.attribute_imports:
+            if _covers(target, file) and (best is None or len(target) >= len(best)):
+                best = target
+        return self.attribute_imports[best] if best is not None else ""
 
 
 def _covers(target: str, file: str) -> bool:
@@ -152,6 +158,7 @@ class _Entry:
     nested: set[str]  # keys whose value is a nested mapping/list
 
 
+_FLOW_PAIR = re.compile(r"([\w.@-]+)\s*:\s*('[^']*'|\"[^\"]*\"|\[[^\]]*\]|\{|[^,{}\[\]]+)")
 _FLOW_PATH = re.compile(r"\bpath\s*:\s*([^,}]+)")
 _YAML_KEY = re.compile(r"([\w.@-]+|'[^']*'|\"[^\"]*\")\s*:(?:\s+(.*))?$")
 
@@ -163,6 +170,33 @@ def _unquote(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         return value[1:-1]
     return value
+
+
+def _flow_entry(entry: _Entry, text: str) -> None:
+    """Top-level keys of a one-line flow mapping. A key whose value is a
+    nested mapping (``prefix: {en: '', nl: /nl}``) is recorded as nested,
+    and that mapping's own keys are skipped."""
+    body = text[1:]
+    pos = 0
+    depth = 0
+    parent = None
+    for pair in _FLOW_PAIR.finditer(body):
+        between = body[pos : pair.start()]
+        depth += between.count("{") - between.count("}")
+        pos = pair.end()
+        name, value = pair.group(1), pair.group(2)
+        if depth == 1 and parent is not None and value != "{":
+            # `resource: {path: ../src/Controller/, namespace: ...}`.
+            entry.values.setdefault(f"{parent}.{name}", value.strip())
+            continue
+        if depth > 0:
+            continue
+        if value == "{":
+            entry.nested.add(name)
+            parent = name
+            depth += 1
+        elif name not in entry.values and name not in entry.nested:
+            entry.values[name] = value.strip()
 
 
 def parse_yaml_entries(text: str) -> list[_Entry]:
@@ -204,6 +238,11 @@ def parse_yaml_entries(text: str) -> list[_Entry]:
                 entries.append(entry)
                 child_indent = None
                 parent_key = None
+                inline = (key.group(2) or "").strip()
+                if inline.startswith("{"):
+                    # `name: { path: /x, methods: [GET] }` on one line.
+                    _flow_entry(entry, inline)
+                    entry = None
             continue
         if entry is None or not key or indent < base:
             continue
@@ -288,12 +327,12 @@ def load_route_config(read, list_dir) -> RouteConfig:
     roots = list(ROUTE_CONFIG_FILES)
     for directory in ROUTE_CONFIG_DIRS:
         roots += sorted(f for f in list_dir(directory) if f.endswith(ROUTE_CONFIG_SUFFIXES))
-    seen: set[str] = set()
+    seen: set[tuple[str, str]] = set()
 
-    def load(relative: str, prefixes: list[str | None], depth: int) -> None:
+    def load(relative: str, prefix: str, depth: int) -> None:
         if len(seen) >= MAX_CONFIG_FILES or depth > MAX_IMPORT_DEPTH:
             return
-        key = f"{relative}\0{prefixes}"
+        key = (relative, prefix)
         if key in seen:
             return
         seen.add(key)
@@ -305,7 +344,7 @@ def load_route_config(read, list_dir) -> RouteConfig:
         for entry in entries:
             values = entry.values
             if "resource" in values or "resource" in entry.nested:
-                _import(entry, base_dir, prefixes, depth)
+                _import(entry, base_dir, prefix, depth)
                 continue
             if "path" in entry.nested or "path" not in values:
                 continue  # localized path map, or not a route
@@ -313,13 +352,12 @@ def load_route_config(read, list_dir) -> RouteConfig:
             if not path.startswith("/"):
                 path = "/" + path
             methods = _methods(_unquote(values.get("methods", ""))) or ["ANY"]
-            for prefix in prefixes:
-                if prefix is None:
-                    continue  # an unreadable prefix: the full path is unknown
-                for method in methods:
-                    config.routes.append(ConfigRoute(method, _join_all(prefix, path), relative, entry.line))
+            full = import_prefix(prefix, path)
+            config.route_sets[(relative, entry.line)] = [
+                ConfigRoute(method, full, relative, entry.line) for method in methods
+            ]
 
-    def _import(entry: _Entry, base_dir: str, prefixes: list[str | None], depth: int) -> None:
+    def _import(entry: _Entry, base_dir: str, prefix: str, depth: int) -> None:
         values = entry.values
         resource = values.get("resource") or values.get("resource.path")
         if resource is None:
@@ -331,15 +369,17 @@ def load_route_config(read, list_dir) -> RouteConfig:
             if inner is None:
                 return
             resource = _unquote(inner.group(1))
-        if "prefix" in entry.nested:
-            own: str | None = None  # localized prefix map
+        if "prefix" in entry.nested or _unquote(values.get("prefix", "")).startswith("{"):
+            # A localized prefix map (`prefix: {en: '', nl: /nl}`): the
+            # real path is one of several, so mark the segment unknown.
+            own = "/" + ra.DYNAMIC_SEGMENT
         else:
             own = _unquote(values.get("prefix", ""))
-        combined = [None if p is None or own is None else _join_prefix(p, own) for p in prefixes]
+        combined = _join_prefix(prefix, own)
         kind = _unquote(values.get("type", ""))
         if resource == "routing.controllers":
             # Symfony 7.1+: every attribute-routed controller (src/).
-            config.attribute_imports += [AttributeImport("src/", p) for p in combined]
+            config.add_import("src/", combined)
             return
         target = _resolve(base_dir, resource)
         if target is None:
@@ -347,10 +387,10 @@ def load_route_config(read, list_dir) -> RouteConfig:
         if target.endswith(ROUTE_CONFIG_SUFFIXES) and kind not in ("attribute", "annotation"):
             load(target, combined, depth + 1)
         elif kind in ("attribute", "annotation") or target.endswith("/") or target.endswith(".php"):
-            config.attribute_imports += [AttributeImport(target, p) for p in combined]
+            config.add_import(target, combined)
 
     for relative in roots:
-        load(relative, [""], 0)
+        load(relative, "", 0)
     return config
 
 
@@ -359,6 +399,3 @@ def _join_prefix(outer: str, inner: str) -> str:
     outer = outer.strip().rstrip("/")
     return f"{outer}/{inner}" if inner else outer
 
-
-def _join_all(prefix: str, path: str) -> str:
-    return import_prefix(prefix, path)

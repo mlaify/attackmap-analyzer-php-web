@@ -29,6 +29,7 @@ input stays linear.
 
 from __future__ import annotations
 
+import bisect
 import posixpath
 import re
 from dataclasses import dataclass, field
@@ -43,7 +44,7 @@ DYNAMIC = "dyn"
 Prefix = tuple[str, str]
 NO_PREFIX: Prefix = (LITERAL, "")
 # Shown in place of a prefix that can't be read statically.
-DYNAMIC_SEGMENT = "{prefix}"
+DYNAMIC_SEGMENT = ra.DYNAMIC_SEGMENT
 
 VERBS = frozenset({"get", "post", "put", "patch", "delete", "options", "head", "any"})
 RESOURCE_CALLS = frozenset({"resource", "apiResource", "resources", "apiResources"})
@@ -82,12 +83,16 @@ _RESOURCE_ACTIONS = (
     ("destroy", ("DELETE",), True, ""),
 )
 _API_ACTIONS = frozenset({"index", "store", "show", "update", "destroy"})
+# A controller class reference is read this far.
+_NAME_SCAN = 500
 # `Route::resources([...])` entries read per statement.
 MAX_RESOURCES = 64
 # Route-file mounts followed transitively this deep, and at most this many
 # distinct mount chains per file.
 MAX_MOUNT_DEPTH = 8
 MAX_MOUNT_CHAINS = 8
+# Mount edges followed per repo before the rest stay unresolved.
+MAX_MOUNT_VISITS = 4096
 
 _STATEMENT = re.compile(r"\bRoute::(\w+)\s*\(")
 _STRING_ARG = re.compile(r"\s*(?:'([^'\\]*)'|\"([^\"\\]*)\")")
@@ -108,7 +113,10 @@ _MOUNT_REF = re.compile(
 _MOUNT_LEAD = re.compile(
     r"(?:\b(?:require|include)(?:_once)?\s*\(?|\bloadRoutesFrom\s*\(|->\s*group\s*\(|\bapi\s*:\s*\[?)\s*$"
 )
-_API_NAMED_ARG = re.compile(r"\bapi\s*:\s*\[?\s*$")
+_API_ARG = re.compile(r"\bapi\s*:\s*")
+# Mount references and withRouting calls read per file.
+MAX_MOUNT_REFS = 512
+MAX_ROUTING_CALLS = 16
 
 
 @dataclass
@@ -149,8 +157,9 @@ class FileScan:
 
 def _string_at(content: str, pos: int, end: int) -> tuple[str | None, int]:
     """A string literal starting at ``pos`` (after whitespace), and the
-    offset past it; ``(None, pos)`` when there isn't one."""
-    match = _STRING_ARG.match(content, pos, end)
+    offset past it; ``(None, pos)`` when there isn't one. Read at most
+    ``_ARG_SCAN`` characters."""
+    match = _STRING_ARG.match(content, pos, min(end, pos + ra._ARG_SCAN))
     if not match:
         return None, pos
     value = match.group(1) if match.group(1) is not None else match.group(2)
@@ -159,6 +168,8 @@ def _string_at(content: str, pos: int, end: int) -> tuple[str | None, int]:
 
 def _prefix_value(content: str, start: int, end: int) -> Prefix:
     """Classify the expression ``content[start:end]`` as a prefix."""
+    if end - start > ra._ARG_SCAN:
+        return (DYNAMIC, "")  # not a literal or a config() call
     value, after = _string_at(content, start, end)
     if value is not None and not content[after:end].strip():
         return (LITERAL, value)
@@ -233,19 +244,23 @@ def _group_from(links: list[ra.Link], group: ra.Link, content: str) -> LaravelGr
         if link.name == "prefix":
             prefixes.append(_prefix_value(content, link.open + 1, link.close))
         elif link.name == "controller":
-            controller = _class_name(content[link.open + 1 : link.close])
+            controller = _class_name(content[link.open + 1 : min(link.close, link.open + _NAME_SCAN)])
     span = _array_span(content, group)
     if span is not None:
         # Legacy `Route::group(['prefix' => 'x', 'middleware' => ...], fn)`.
         attrs_open, attrs_close = span
         attrs_end = min(attrs_close, attrs_open + ra._ARG_SCAN)
         ra.add_group_attr_middleware(scope, content[attrs_open + 1 : attrs_end])
+        read: set[str] = set()
         for attr in _GROUP_ATTR.finditer(content, attrs_open + 1, attrs_end):
+            if attr.group(1) in read:
+                continue  # the first `'prefix' =>` / `'controller' =>` counts
+            read.add(attr.group(1))
             value_end = _expr_end(content, attr.end(), attrs_close)
             if attr.group(1) == "prefix":
                 prefixes.append(_prefix_value(content, attr.end(), value_end))
             else:
-                controller = _class_name(content[attr.end() : value_end]) or controller
+                controller = _class_name(content[attr.end() : min(value_end, attr.end() + _NAME_SCAN)]) or controller
     if prefixes:
         prefix = _join_prefixes(prefixes)
     return LaravelGroup(group.open, group.close, scope, prefix, controller)
@@ -368,7 +383,7 @@ def _statement_routes(
         second = _second_arg(content, link)
         controller = None
         if second is not None:
-            controller = _class_name(content[second : _expr_end(content, second, end)])
+            controller = _class_name(content[second : min(_expr_end(content, second, end), second + _NAME_SCAN)])
         entries.append((resource, controller))
     else:
         span = _array_span(content, link)
@@ -425,7 +440,7 @@ def scan_file(content: str, relative: str) -> FileScan:
         prefixes: list[Prefix] = []
         for chained in before:
             if chained.name == "controller":
-                controller = _class_name(content[chained.open + 1 : chained.close])
+                controller = _class_name(content[chained.open + 1 : min(chained.close, chained.open + _NAME_SCAN)])
             elif chained.name == "prefix":
                 prefixes.append(_prefix_value(content, chained.open + 1, chained.close))
         found = _statement_routes(content, link, after, scope)
@@ -435,40 +450,66 @@ def scan_file(content: str, relative: str) -> FileScan:
             # `Route::prefix('x')->get('/y')`: a one-route group.
             prefix = _join_prefixes(prefixes)
             found = [(methods, _join([prefix], uri), action) for methods, uri, action in found]
-        pending.append((match.start(), found, scope, controller))
+        pending.append((match.start(), found, scope, controller, link.open))
 
     ordered = sorted(pending, key=lambda item: item[0])
     enclosing = ra.enclosing(groups, [offset for offset, *_ in ordered])
-    for (offset, found, scope, controller), outer in zip(ordered, enclosing):
+    for (offset, found, scope, controller, args_open), outer in zip(ordered, enclosing):
+        # The route's own `->controller()` wins, then the innermost group's.
         group_controller = controller
-        if outer:
-            for group in outer:
-                group_controller = group.controller or group_controller
+        if group_controller is None and outer:
+            group_controller = next((g.controller for g in reversed(outer) if g.controller), None)
         for methods, uri, action in found:
-            action = action or _controller_action(content, offset, group_controller)
+            action = action or _controller_action(content, args_open, group_controller)
             scan.routes.append(LaravelRoute(methods, uri, offset, scope, action, outer))
 
     scan.mounts = _mounts(content, relative, groups)
     return scan
 
 
-_BARE_ACTION = re.compile(r"\s*\\?(?:[\w\\]+::)?\w+\s*\(\s*['\"][^'\"]*['\"]\s*,\s*['\"](\w+)['\"]")
+_BARE_ACTION = re.compile(r"\(\s*['\"][^'\"]*['\"]\s*,\s*['\"](\w+)['\"]")
 
 
-def _controller_action(content: str, offset: int, controller: str | None) -> tuple[str, str] | None:
-    """``Route::controller(C::class)->group(fn () => Route::get('/x', 'show'))``."""
+def _controller_action(content: str, args_open: int, controller: str | None) -> tuple[str, str] | None:
+    """``Route::controller(C::class)->group(fn () => Route::get('/x', 'show'))``:
+    a bare method name as the verb's second argument (``args_open`` is its
+    ``(``)."""
     if controller is None:
         return None
-    match = _BARE_ACTION.match(content, offset, offset + 500)
+    match = _BARE_ACTION.match(content, args_open, args_open + 500)
     return (controller, match.group(1)) if match else None
+
+
+def _api_ranges(content: str) -> list[tuple[int, int, str]]:
+    """``(start, end, apiPrefix)`` for each ``withRouting(api: ...)``
+    argument: one file, or an array of files (Laravel 11)."""
+    ranges = []
+    pairs = ra.bracket_pairs(content)
+    for match in _WITH_ROUTING.finditer(content):
+        close = pairs.get(match.end() - 1, -1)
+        if close < 0:
+            continue
+        api_prefix = _API_PREFIX.search(content, match.end(), close)
+        prefix = api_prefix.group(1) if api_prefix else "api"
+        api_arg = _API_ARG.search(content, match.end(), close)
+        if api_arg is None:
+            continue
+        value = api_arg.end()
+        if content.startswith("[", value):
+            value_end = pairs.get(value, -1)
+            if value_end < 0:
+                continue
+        else:
+            value_end = _expr_end(content, value, close)
+        ranges.append((value, value_end, prefix))
+        if len(ranges) >= MAX_ROUTING_CALLS:
+            break
+    return ranges
 
 
 def _mounts(content: str, relative: str, groups: list[LaravelGroup]) -> list[Mount]:
     refs: list[tuple[int, str]] = []
     for match in _MOUNT_REF.finditer(content):
-        lead = content[max(0, match.start() - 60) : match.start()]
-        if not _MOUNT_LEAD.search(lead) and not _inside(groups, match.start()):
-            continue
         if match.group(1) is not None:
             target = posixpath.normpath(match.group(1).lstrip("/"))
         else:
@@ -476,29 +517,31 @@ def _mounts(content: str, relative: str, groups: list[LaravelGroup]) -> list[Mou
         if target.startswith("..") or target == relative:
             continue
         refs.append((match.start(), target))
+        if len(refs) >= MAX_MOUNT_REFS:
+            break
     if not refs:
         return []
-    routing_spans = []
-    for match in _WITH_ROUTING.finditer(content):
-        close = ra.matching_close(content, match.end() - 1)
-        if close > 0:
-            api_prefix = _API_PREFIX.search(content, match.end(), close)
-            routing_spans.append((match.end(), close, api_prefix.group(1) if api_prefix else "api"))
+    api_ranges = _api_ranges(content) if "withRouting" in content else []
+    api_starts = [start for start, _, _ in api_ranges]
     enclosing = ra.enclosing(groups, [offset for offset, _ in refs])
     mounts = []
     for (offset, target), outer in zip(refs, enclosing):
-        outer = list(outer) if outer is not None else None
-        for start, end, api_prefix in routing_spans:
-            lead = content[max(start, offset - 40) : offset]
-            if start <= offset <= end and _API_NAMED_ARG.search(lead) and outer is not None:
-                # Laravel 11 `->withRouting(api: __DIR__.'/../routes/api.php', apiPrefix: 'api/v1')`.
-                outer.append(LaravelGroup(start, end, prefix=(LITERAL, api_prefix)))
+        api = None
+        index = bisect.bisect_right(api_starts, offset) - 1
+        if index >= 0 and api_ranges[index][0] <= offset <= api_ranges[index][1]:
+            api = api_ranges[index]
+        lead = content[max(0, offset - 60) : offset]
+        # The file is loaded (not just named): a require/loadRoutesFrom/
+        # ->group( lead, inside a group, or a withRouting `api:` argument.
+        if api is None and outer == [] and not _MOUNT_LEAD.search(lead):
+            continue
+        if outer is not None:
+            outer = list(outer)
+            if api is not None:
+                # `->withRouting(api: [__DIR__.'/../routes/api.php', ...], apiPrefix: 'api/v1')`.
+                outer.append(LaravelGroup(api[0], api[1], prefix=(LITERAL, api[2])))
         mounts.append(Mount(target, outer))
     return mounts
-
-
-def _inside(groups: list[LaravelGroup], offset: int) -> bool:
-    return any(group.start < offset < group.end for group in groups)
 
 
 def _join(prefixes: list[Prefix], uri: str) -> str:
@@ -525,19 +568,24 @@ class MountResolver:
     ``sites[target]`` lists ``(source file, groups at the mount)``. A file no
     one mounts is loaded at the root, except ``routes/api.php``, which
     Laravel's default provider mounts under ``default_api`` (``/api``).
-    Chains are followed MAX_MOUNT_DEPTH deep; a cycle or anything deeper is
-    None (unresolved).
+
+    Each target is resolved once (memoised at every depth), so the work is
+    linear in the mount edges times MAX_MOUNT_CHAINS. A target reached
+    again while it is being resolved (a cycle), past MAX_MOUNT_DEPTH, or
+    after MAX_MOUNT_VISITS edges have been followed is None (unresolved).
     """
 
     def __init__(self, sites: dict[str, list[tuple[str, list[LaravelGroup] | None]]], default_api: Prefix) -> None:
         self.sites = sites
         self.default_api = default_api
         self._memo: dict[str, list[list[LaravelGroup] | None]] = {}
+        self._active: set[str] = set()
+        self._visits = 0
 
     def chains(self, target: str) -> list[list[LaravelGroup] | None]:
-        return self._chains(target, 0, frozenset())
+        return self._chains(target, 0)
 
-    def _chains(self, target: str, depth: int, visiting: frozenset[str]) -> list[list[LaravelGroup] | None]:
+    def _chains(self, target: str, depth: int) -> list[list[LaravelGroup] | None]:
         if target in self._memo:
             return self._memo[target]
         sites = self.sites.get(target)
@@ -545,11 +593,15 @@ class MountResolver:
             if target == "routes/api.php":
                 return [[LaravelGroup(-1, -1, prefix=self.default_api)]]
             return [[]]
-        if depth >= MAX_MOUNT_DEPTH or target in visiting:
+        if depth >= MAX_MOUNT_DEPTH or target in self._active or self._visits >= MAX_MOUNT_VISITS:
             return [None]
+        self._active.add(target)
         out: list[list[LaravelGroup] | None] = []
         for source, groups in sites:
-            for parent in self._chains(source, depth + 1, visiting | {target}):
+            self._visits += 1
+            if self._visits > MAX_MOUNT_VISITS:
+                break
+            for parent in self._chains(source, depth + 1):
                 chain = None if parent is None or groups is None else parent + groups
                 if not any(chain is other or chain == other for other in out):
                     out.append(chain)
@@ -557,6 +609,6 @@ class MountResolver:
                     break
             if len(out) >= MAX_MOUNT_CHAINS:
                 break
-        if depth == 0:
-            self._memo[target] = out
-        return out
+        self._active.discard(target)
+        self._memo[target] = out or [None]
+        return self._memo[target]

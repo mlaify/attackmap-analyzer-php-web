@@ -220,7 +220,7 @@ class PhpWebAnalyzer:
     ) -> None:
         for route in config.routes:
             index = self._append_unique_route(result, route.path, route.method, route.file, route.line, seen=seen)
-            if index is not None and access_rules:
+            if index is not None and access_rules and ra.DYNAMIC_SEGMENT not in route.path:
                 rule = ra.resolve_access_control(access_rules, route.path, route.method)
                 if rule is not None:
                     self._set_route_auth(result, index, ra.combine([rule]))
@@ -381,7 +381,7 @@ class PhpWebAnalyzer:
             return
         decl_ends = ra.class_decl_ends(content)
         class_blocks = {block.target_offset: block for block in blocks if block.target == "class"}
-        import_prefixes, certain = route_config.prefixes_for(relative) if route_config else ([""], True)
+        import_prefix = route_config.prefix_for(relative) if route_config else ""
         # (offset, path, methods, block, owner class block)
         found: list[tuple[int, str, list[str], ra.AttributeBlock, ra.AttributeBlock | None]] = []
         prefixed_classes: set[int] = set()
@@ -414,14 +414,13 @@ class PhpWebAnalyzer:
         found.sort(key=lambda item: item[0])
         for offset, path, methods, block, owner in found:
             line = line_of(content, offset)
-            for import_prefix in import_prefixes:
-                full = sf.import_prefix(import_prefix, path)
-                path_known = certain and lr.DYNAMIC_SEGMENT not in full
-                for method in methods or ["ANY"]:
-                    index = self._append_unique_route(result, full, method, relative, line, seen=seen)
-                    if index is not None:
-                        rules = access_rules if path_known else []
-                        self._set_route_auth(result, index, self._symfony_resolution(block, owner, full, method, rules))
+            full = sf.import_prefix(import_prefix, path)
+            # access_control is only matched against a fully known path.
+            rules = access_rules if lr.DYNAMIC_SEGMENT not in full else []
+            for method in methods or ["ANY"]:
+                index = self._append_unique_route(result, full, method, relative, line, seen=seen)
+                if index is not None:
+                    self._set_route_auth(result, index, self._symfony_resolution(block, owner, full, method, rules))
 
     @staticmethod
     def _route_attrs(block: ra.AttributeBlock) -> list[tuple[int, sf.RouteAttr]]:

@@ -237,6 +237,82 @@ def test_mount_cycle_does_not_recurse(tmp_path: Path) -> None:
     assert all(r.auth == "unknown" for r in routes.values())
 
 
+def test_with_routing_api_array_prefixes_every_file(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "routes/api.php": "<?php\nRoute::get('/user', fn () => 1);\n",
+            "routes/api_admin.php": "<?php\nRoute::delete('/users/{id}', fn () => 1);\n",
+            "bootstrap/app.php": (
+                "<?php\nreturn Application::configure(basePath: dirname(__DIR__))\n"
+                "    ->withRouting(\n"
+                "        api: [__DIR__.'/../routes/api.php', __DIR__.'/../routes/api_admin.php'],\n"
+                "        apiPrefix: 'api/v1',\n"
+                "    )->create();\n"
+            ),
+        },
+    )
+    assert set(_routes(tmp_path)) == {"GET /api/v1/user", "DELETE /api/v1/users/{id}"}
+
+
+def test_route_controller_beats_the_enclosing_group_controller(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "routes/web.php": (
+                "<?php\nRoute::controller(A::class)->group(function () {\n"
+                "    Route::controller(B::class)->delete('/x', 'destroy');\n"
+                "    Route::get('/y', 'destroy');\n});\n"
+            ),
+            "app/A.php": "<?php\nclass A {\n    public function __construct() {\n        $this->middleware('auth');\n    }\n}\n",
+            "app/B.php": "<?php\nclass B {\n    public function __construct() {\n        $this->middleware('auth')->except(['destroy']);\n    }\n}\n",
+        },
+    )
+    routes = _routes(tmp_path)
+    assert routes["DELETE /x"].auth == "anonymous"  # B's except, not A's guard
+    assert routes["GET /y"].auth == "required"  # the group's A
+
+
+def _mount_graph(tmp_path: Path, edges: dict[str, list[str]]) -> None:
+    files = {}
+    for source, targets in edges.items():
+        body = "".join(f"require base_path('routes/{t}.php');\n" for t in targets)
+        files[f"routes/{source}.php"] = f"<?php\nRoute::prefix('{source}')->group(function () {{\n{body}}});\n" + (
+            f"Route::get('/{source}', fn () => 1);\n"
+        )
+    _write(tmp_path, files)
+
+
+def test_dense_mutual_mounts_stay_fast(tmp_path: Path) -> None:
+    names = [f"f{i}" for i in range(16)]
+    _mount_graph(tmp_path, {n: [m for m in names if m != n] for n in names})
+    start = time.perf_counter()
+    result = PhpWebAnalyzer().analyze(tmp_path)
+    assert time.perf_counter() - start < 5.0
+    assert len(result.routes) >= len(names)
+
+
+def test_deep_layered_mounts_stay_fast(tmp_path: Path) -> None:
+    layers = [[f"l{d}n{i}" for i in range(9)] for d in range(12)]
+    edges = {name: (layers[d + 1] if d + 1 < len(layers) else []) for d, layer in enumerate(layers) for name in layer}
+    _mount_graph(tmp_path, edges)
+    start = time.perf_counter()
+    routes = _routes(tmp_path)
+    assert time.perf_counter() - start < 5.0
+    # Layer 1 is mounted only under layer 0's groups.
+    assert any(key.startswith("GET /l0n0/l1n0") for key in routes)
+
+
+def test_many_mount_refs_and_with_routing_calls_stay_fast(tmp_path: Path) -> None:
+    content = "<?php\n" + "->withRouting(api: __DIR__.'/../routes/api.php')\n" * 6000 + (
+        "require base_path('routes/x.php');\n" * 12000
+    )
+    _write(tmp_path, {"bootstrap/app.php": content, "routes/api.php": "<?php\nRoute::get('/u', fn () => 1);\n"})
+    start = time.perf_counter()
+    PhpWebAnalyzer().analyze(tmp_path)
+    assert time.perf_counter() - start < 5.0
+
+
 def test_singular_and_resource_expansion() -> None:
     assert [lr.singular(w) for w in ("photos", "categories", "boxes", "news-items", "status")] == [
         "photo",
@@ -342,8 +418,51 @@ def test_symfony_unreadable_import_prefix_skips_access_control(tmp_path: Path) -
         },
     )
     route = PhpWebAnalyzer().analyze(tmp_path).routes[0]
-    # The real path is /en/a or /nl/a; access_control can't be matched on /a.
-    assert (route.path, route.auth) == ("/a", "unknown")
+    # The real path is /en/a or /nl/a: the prefix is marked unknown, and
+    # access_control (which would otherwise grant `^/`) isn't matched.
+    assert (route.path, route.auth) == ("/{prefix}/a", "unknown")
+
+
+def test_repeated_imports_of_the_same_target_keep_the_last_prefix(tmp_path: Path) -> None:
+    # Symfony keys routes by name: a later import of the same controllers
+    # replaces the earlier one, so each route exists once, under the last prefix.
+    imports = "".join(
+        f"c{i}: {{ resource: ../../src/Controller/, type: attribute, prefix: /p{i} }}\n" for i in range(2000)
+    )
+    files = {f"config/routes/r{j}.yaml": imports for j in range(16)}
+    files["config/routes/zz.yaml"] = "again:\n    resource: ../../src/Controller/\n    type: attribute\n    prefix: /last\n"
+    files["config/routes/zz_files.yaml"] = "".join(
+        f"f{i}:\n    resource: ../legacy.yaml\n    prefix: /v{i}\n" for i in range(50)
+    )
+    files["config/legacy.yaml"] = "legacy:\n    path: /old\n"
+    files["src/Controller/A.php"] = "<?php\nclass A {\n" + "".join(
+        f"    #[Route('/a{i}', methods: ['GET'])]\n    public function a{i}() {{}}\n" for i in range(40)
+    ) + "}\n"
+    _write(tmp_path, files)
+    start = time.perf_counter()
+    routes = _routes(tmp_path)
+    assert time.perf_counter() - start < 5.0
+    attribute = [key for key, r in routes.items() if r.file == "src/Controller/A.php"]
+    assert len(attribute) == 40
+    assert all(key.startswith("GET /last/a") for key in attribute)
+    legacy = [key for key, r in routes.items() if r.file == "config/legacy.yaml"]
+    assert len(legacy) == 1
+
+
+def test_localized_import_prefix_is_a_placeholder(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        {
+            "config/routes.yaml": (
+                "controllers:\n    resource: ../src/Controller/\n    type: attribute\n"
+                "    prefix: {en: '', nl: '/nl'}\n"
+                "shop:\n    resource: shop.yaml\n    prefix:\n        en: /shop\n        nl: /winkel\n"
+            ),
+            "config/shop.yaml": "cart:\n    path: /cart\n    methods: [POST]\n",
+            "src/Controller/A.php": "<?php\nclass A {\n    #[Route('/a')]\n    public function a() {}\n}\n",
+        },
+    )
+    assert set(_routes(tmp_path)) == {"ANY /{prefix}/a", "POST /{prefix}/cart"}
 
 
 def test_route_attribute_parsing() -> None:
@@ -353,6 +472,18 @@ def test_route_attribute_parsing() -> None:
     assert sf.route_attribute("Route(name: 'admin_')") == sf.RouteAttr("", [])
     assert sf.route_attribute("IsGranted('ROLE_USER')") is None
     assert sf.route_attribute("Router('/z')") is None
+
+
+def test_yaml_flow_mapping_entries() -> None:
+    entries = sf.parse_yaml_entries(
+        "a: { path: '/a', methods: [GET, POST] }\n"
+        "b: { resource: ../src/, prefix: {en: '', nl: /nl}, type: attribute }\n"
+        "c: { resource: {path: ../src/C/, namespace: App}, prefix: /q }\n"
+    )
+    assert entries[0].values == {"path": "'/a'", "methods": "[GET, POST]"}
+    assert entries[1].nested == {"prefix"} and "prefix" not in entries[1].values
+    assert (entries[1].values["resource"], entries[1].values["type"]) == ("../src/", "attribute")
+    assert entries[2].values == {"resource.path": "../src/C/", "resource.namespace": "App", "prefix": "/q"}
 
 
 def test_yaml_when_prod_block_is_read() -> None:
@@ -425,8 +556,10 @@ def test_fuzz_analyzer_on_truncated_and_garbled_fixtures(tmp_path: Path) -> None
         "<?php\n" + "Route::middleware('x')/*\n" * 10000,
         "<?php\n" + "#[Route('/a'), " * 8000,
         "<?php\n" + "require base_path('routes/api.php');\n" * 5000,
+        "<?php\n" + "Route::prefix(Route::controller(" * 6000 + "'x'" + "))" * 6000 + "->group(fn () => 1);",
+        "<?php\n" + "Route::group([" + "'prefix' => 'prefix' => " * 12000 + "], fn () => 1);",
     ],
-    ids=["deep-groups", "unbalanced-groups", "unclosed-groups", "long-chains", "huge-resources", "heredocs", "comments", "attrs", "mounts"],
+    ids=["deep-groups", "unbalanced-groups", "unclosed-groups", "long-chains", "huge-resources", "heredocs", "comments", "attrs", "mounts", "nested-args", "repeated-keys"],
 )
 def test_adversarial_input_stays_fast(tmp_path: Path, content: str) -> None:
     _write(tmp_path, {"routes/api.php": content})

@@ -33,6 +33,9 @@ REQUIRED = "required"
 ANONYMOUS = "anonymous"
 UNKNOWN = "unknown"
 
+# Stands in for a path prefix that can't be read statically.
+DYNAMIC_SEGMENT = "{prefix}"
+
 _OPEN = "([{"
 _CLOSE = ")]}"
 _EVIDENCE_MAX = 200
