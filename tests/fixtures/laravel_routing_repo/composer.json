@@ -1,0 +1,6 @@
+{
+    "name": "example/laravel-routing",
+    "require": {
+        "laravel/framework": "^10.0"
+    }
+}

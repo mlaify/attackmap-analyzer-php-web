@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<routes xmlns="http://symfony.com/schema/routing">
+    <route id="health" path="/health" controller="App\Health\Check" methods="GET|HEAD"/>
+    <!-- <route id="old_admin" path="/old-admin" controller="App\Old"/> -->
+    <route id="hooks" path="/hooks/{provider}" controller="App\Hooks\Receive" methods="POST"/>
+</routes>

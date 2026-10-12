@@ -6,7 +6,9 @@ from pathlib import Path
 
 from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, rel
 
+from . import laravel_routes as lr
 from . import route_auth as ra
+from . import symfony_routes as sf
 from .contracts import (
     AnalyzerMetadata,
     AuthHint,
@@ -20,10 +22,6 @@ from .contracts import (
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
 
-LARAVEL_ROUTE_PATTERN = re.compile(
-    r"\bRoute::(get|post|put|patch|delete|options|head|any|match)\s*\(\s*['\"]([^'\"]+)['\"]",
-    re.IGNORECASE,
-)
 # Slim / FastRoute-style `$app->get('/path', ...)`. The same shape is every
 # `$request->get('id')`, `$cache->get('k')` and `$config->get(...)`, so the
 # path must be rooted (`/...`) and the receiver must be a router: one of
@@ -33,6 +31,11 @@ SLIM_ROUTE_PATTERN = re.compile(
     r"\$(\w+)->(get|post|put|patch|delete|options|head|any|map)\s*\(\s*['\"](/[^'\"]*)['\"]",
     re.IGNORECASE,
 )
+# Slim `$app->map(['GET', 'POST'], '/path', ...)`: the methods come first.
+SLIM_MAP_PATTERN = re.compile(
+    r"\$(\w+)->map\s*\(\s*\[([^\]]{0,200})\]\s*,\s*['\"](/[^'\"]*)['\"]",
+)
+SLIM_MAP_METHOD_PATTERN = re.compile(r"['\"](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)['\"]", re.IGNORECASE)
 SLIM_ROUTER_NAMES = frozenset({"app", "router", "route", "group", "r"})
 SLIM_ROUTER_ASSIGN_PATTERN = re.compile(
     r"\$(\w+)\s*=\s*(?:AppFactory::create(?:FromContainer)?\s*\(|Bridge::create\s*\(|"
@@ -41,11 +44,6 @@ SLIM_ROUTER_ASSIGN_PATTERN = re.compile(
 SLIM_ROUTER_PARAM_PATTERN = re.compile(
     r"\b(?:RouteCollectorProxy(?:Interface)?|RouteCollector|App)\s+\$(\w+)",
 )
-ATTRIBUTE_ROUTE_PATTERN = re.compile(
-    r"#\[\s*Route\s*\(\s*['\"]([^'\"]+)['\"](?P<args>.*?)\)\s*\]",
-    re.IGNORECASE | re.DOTALL,
-)
-ATTRIBUTE_METHOD_PATTERN = re.compile(r"['\"](GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)['\"]", re.IGNORECASE)
 # Config-array routes (Mezzio-style `'routes' => [['path' => '/x', ...]]`).
 # Only rooted paths in files that declare a `'routes'`/`'router'` key: every
 # other `'path' =>` (Laravel `config/logging.php`, filesystem disks, cache
@@ -59,6 +57,12 @@ SECURITY_CONFIG_PATHS = (
     "config/security.yaml",
     "app/config/security.yml",
 )
+# `config('file.key')` route prefixes are read from config/<file>.php:
+# `'key' => 'value'` or `'key' => env('NAME', 'default')`.
+CONFIG_VALUE_PATTERN = re.compile(
+    r"['\"]([\w-]+)['\"]\s*=>\s*(?:env\s*\(\s*['\"][\w-]*['\"]\s*,\s*)?['\"]([^'\"]*)['\"]"
+)
+CONFIG_NAME_PATTERN = re.compile(r"[\w-]+")
 
 OUTBOUND_PATTERNS = [
     re.compile(r"curl_init\s*\(\s*['\"](https?://[^'\"]+)['\"]", re.IGNORECASE),
@@ -146,11 +150,13 @@ class PhpWebAnalyzer:
 
         self._extract_composer_signals(root, result)
         access_rules = self._load_access_control(root)
-        # Laravel routes are resolved after the walk: a controller's
-        # constructor middleware lives in another file (route index, scope,
-        # action).
-        laravel_pending: list[tuple[int, ra.LaravelScope, list[ra.LaravelGroup], tuple[str, str] | None]] = []
+        route_config = self._load_route_config(root)
+        # Laravel routes are resolved after the walk: a route file's prefix
+        # and middleware can come from the provider that mounts it, and a
+        # controller's constructor middleware lives in another file.
+        laravel_scans: dict[str, tuple[str, lr.FileScan]] = {}
         controllers: dict[str, list[ra.ControllerGuard]] = {}
+        seen_routes: dict[tuple[str, str, str], int] = {}
 
         # Pruned by repo-relative dir name (vendor, node_modules, .git, ...);
         # symlinks out of the repo are not followed (AttackMap#253).
@@ -164,7 +170,10 @@ class PhpWebAnalyzer:
                 continue
 
             relative = rel(file_path, root)
-            self._extract_routes(content, relative, result, access_rules, laravel_pending)
+            laravel = lr.scan_file(content, relative)
+            if laravel.routes or laravel.mounts:
+                laravel_scans[relative] = (content, laravel)
+            self._extract_routes(content, relative, result, access_rules, route_config, seen_routes)
             for cls, guards in ra.laravel_controller_guards(content).items():
                 controllers.setdefault(cls, []).extend(guards)
             self._extract_external_calls(content, relative, result)
@@ -172,8 +181,8 @@ class PhpWebAnalyzer:
             self._extract_auth_hints(content, relative, result)
             self._extract_secret_hints(content, relative, result)
 
-        for index, scope, groups, action in laravel_pending:
-            self._set_route_auth(result, index, ra.resolve_laravel(scope, groups, action, controllers))
+        self._emit_symfony_config_routes(route_config, result, access_rules, seen_routes)
+        self._emit_laravel_routes(root, laravel_scans, controllers, result, seen_routes)
 
         result.languages.sort()
         return result
@@ -187,6 +196,132 @@ class PhpWebAnalyzer:
             if text is not None:
                 return ra.parse_access_control(text)
         return []
+
+    @staticmethod
+    def _load_route_config(root: Path) -> sf.RouteConfig:
+        def read(relative: str) -> str | None:
+            path = root / relative
+            return read_source(path, root=root) if path.is_file() else None
+
+        def list_dir(relative: str) -> list[str]:
+            directory = root / relative
+            if not directory.is_dir() or directory.is_symlink():
+                return []
+            return [f"{relative}/{child.name}" for child in directory.iterdir() if child.is_file()]
+
+        return sf.load_route_config(read, list_dir)
+
+    def _emit_symfony_config_routes(
+        self,
+        config: sf.RouteConfig,
+        result: ScanResult,
+        access_rules: list[ra.AccessRule],
+        seen: dict,
+    ) -> None:
+        for route in config.routes:
+            index = self._append_unique_route(result, route.path, route.method, route.file, route.line, seen=seen)
+            if index is not None and access_rules and ra.DYNAMIC_SEGMENT not in route.path:
+                rule = ra.resolve_access_control(access_rules, route.path, route.method)
+                if rule is not None:
+                    self._set_route_auth(result, index, ra.combine([rule]))
+
+    def _emit_laravel_routes(
+        self,
+        root: Path,
+        scans: dict[str, tuple[str, lr.FileScan]],
+        controllers: dict[str, list[ra.ControllerGuard]],
+        result: ScanResult,
+        seen: dict,
+    ) -> None:
+        sites: dict[str, list] = {}
+        for relative, (_, scan) in scans.items():
+            for mount in scan.mounts:
+                sites.setdefault(mount.target, []).append((relative, mount.groups, mount.once))
+        # Framework-loaded route files: the default routes/web.php and
+        # routes/api.php, and anything mounted from outside routes/
+        # (bootstrap/app.php `withRouting`, a RouteServiceProvider).
+        framework_roots = set(lr.FRAMEWORK_ROUTE_FILES)
+        for target, target_sites in sites.items():
+            if any(not source.startswith("routes/") for source, _, _ in target_sites):
+                framework_roots.add(target)
+        resolver = lr.MountResolver(sites, (lr.LITERAL, "api"), frozenset(framework_roots))
+        config_cache: dict[str, str | None] = {}
+        for relative, (content, scan) in scans.items():
+            if not scan.routes:
+                continue
+            chains = resolver.chains(relative)
+            # The enclosing groups are fixed by the innermost one, so each
+            # (mount chain, innermost group) pair is joined and merged once,
+            # not once per route.
+            merged: dict[tuple[int, int | None], tuple[str | None, lr.LaravelGroup] | None] = {}
+            resolved: dict[tuple, ra.Resolution] = {}
+            for route in scan.routes:
+                line = line_of(content, route.offset)
+                inner = id(route.groups[-1]) if route.groups else (None if route.groups is None else 0)
+                for index_chain, chain in enumerate(chains):
+                    key = (index_chain, inner)
+                    if key not in merged:
+                        merged[key] = self._merge_groups(root, chain, route.groups, config_cache)
+                    joined = merged[key]
+                    if joined is None:
+                        # Nested past MAX_NESTING or mounted in a cycle: the
+                        # prefix and the enclosing middleware are unknown.
+                        path = lr.join_path([(lr.DYNAMIC, "")], route.uri)
+                    else:
+                        path = lr.join_base(joined[0], route.uri)
+                    for method in route.methods:
+                        index = self._append_unique_route(result, path, method, relative, line, seen=seen)
+                        if index is None or joined is None:
+                            continue
+                        # Same groups, route-level middleware and controller
+                        # guard -> same resolution.
+                        guarded = route.action if route.action and route.action[0] in controllers else None
+                        rkey = (key, tuple(route.scope.applied), tuple(route.scope.excluded), guarded)
+                        if rkey not in resolved:
+                            resolved[rkey] = ra.resolve_laravel(route.scope, [joined[1]], guarded, controllers)
+                        self._set_route_auth(result, index, resolved[rkey])
+
+    def _merge_groups(
+        self,
+        root: Path,
+        chain: list | None,
+        groups: list | None,
+        config_cache: dict[str, str | None],
+    ) -> tuple[str | None, lr.LaravelGroup] | None:
+        """The joined prefix and the merged middleware of ``chain + groups``."""
+        if chain is None or groups is None:
+            return None
+        outer = chain + groups
+        prefixes = [self._resolve_prefix(root, group.prefix, config_cache) for group in outer]
+        # One entry per middleware name (the outermost evidence), so the
+        # merged scope is as long as the distinct names, not the groups.
+        applied: dict[str, tuple[str, str]] = {}
+        excluded: dict[str, tuple[str, str]] = {}
+        for group in outer:
+            for name, evidence in group.scope.applied:
+                applied.setdefault(name, (name, evidence))
+            for name, evidence in group.scope.excluded:
+                excluded.setdefault(name, (name, evidence))
+        scope = ra.LaravelScope(list(applied.values()), list(excluded.values()))
+        return lr.prefix_base(prefixes), lr.LaravelGroup(-1, -1, scope)
+
+    @staticmethod
+    def _resolve_prefix(root: Path, prefix: lr.Prefix, cache: dict[str, str | None]) -> lr.Prefix:
+        """A literal for ``config('file.key')`` when config/<file>.php sets
+        the key to a literal (or an ``env()`` default); else dynamic."""
+        kind, value = prefix
+        if kind != lr.CONFIG:
+            return prefix
+        if value not in cache:
+            cache[value] = None
+            name, key = value.split(".", 1)
+            if CONFIG_NAME_PATTERN.fullmatch(name) and CONFIG_NAME_PATTERN.fullmatch(key):
+                text = read_source(root / "config" / f"{name}.php", root=root)
+                if text is not None:
+                    found = (m.group(2) for m in CONFIG_VALUE_PATTERN.finditer(text) if m.group(1) == key)
+                    cache[value] = next(found, None)
+        literal = cache[value]
+        return (lr.LITERAL, literal) if literal is not None else (lr.DYNAMIC, "")
 
     def _extract_composer_signals(self, root: Path, result: ScanResult) -> None:
         text = read_source(root / "composer.json", root=root)
@@ -225,88 +360,134 @@ class PhpWebAnalyzer:
         relative: str,
         result: ScanResult,
         access_rules: list[ra.AccessRule] | None = None,
-        laravel_pending: list | None = None,
+        route_config: sf.RouteConfig | None = None,
+        seen: dict | None = None,
     ) -> None:
-        laravel_matches = list(LARAVEL_ROUTE_PATTERN.finditer(content))
-        laravel_groups = ra.laravel_groups(content) if laravel_matches else []
-        laravel_enclosing = ra.enclosing(laravel_groups, [m.start() for m in laravel_matches])
-        for match, enclosing in zip(laravel_matches, laravel_enclosing):
-            method, path = match.group(1).upper(), match.group(2)
-            if method == "ANY" or method == "MATCH":
-                method = "ANY"
-            index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-            if index is None or laravel_pending is None or enclosing is None:
-                continue
-            open_idx = content.find("(", match.start())
-            close = ra.matching_close(content, open_idx)
-            if close < 0:
-                continue
-            scope = ra.LaravelScope()
-            scope.add_links(ra.parse_chain(content, close + 1))
-            laravel_pending.append((index, scope, enclosing, ra.laravel_action(content, open_idx, close)))
-
-        routers = set(SLIM_ROUTER_NAMES)
-        routers.update(SLIM_ROUTER_ASSIGN_PATTERN.findall(content))
-        routers.update(SLIM_ROUTER_PARAM_PATTERN.findall(content))
-        slim_matches = [m for m in SLIM_ROUTE_PATTERN.finditer(content) if m.group(1) in routers]
-        slim_groups = ra.slim_groups(content, routers) if slim_matches and "->group" in content else []
-        slim_enclosing = ra.enclosing(slim_groups, [m.start() for m in slim_matches])
-        for match, enclosing in zip(slim_matches, slim_enclosing):
-            method, path = match.group(2).upper(), match.group(3)
-            if method == "MAP" or method == "ANY":
-                method = "ANY"
-            index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-            if index is None or enclosing is None:
-                continue
-            close = ra.matching_close(content, content.find("(", match.start()))
-            links = ra.parse_chain(content, close + 1) if close > 0 else []
-            self._set_route_auth(result, index, ra.resolve_slim(links, enclosing))
-
-        blocks = ra.attribute_blocks(content) if ATTRIBUTE_ROUTE_PATTERN.search(content) else []
-        block_of = {offset: block for block in blocks for offset, _ in block.attributes}
-        class_blocks = {block.target_offset: block for block in blocks if block.target == "class"}
-        decl_ends = ra.class_decl_ends(content) if blocks else []
-        for match in ATTRIBUTE_ROUTE_PATTERN.finditer(content):
-            path = match.group(1)
-            args = match.group("args")
-            methods = [m.upper() for m in ATTRIBUTE_METHOD_PATTERN.findall(args)]
-            if not methods:
-                methods = ["ANY"]
-            block = block_of.get(match.start())
-            for method in methods:
-                index = self._append_unique_route(result, path, method, relative, line_of(content, match.start()))
-                if index is not None:
-                    resolution = self._symfony_resolution(
-                        block, decl_ends, class_blocks, path, method, access_rules or []
-                    )
-                    self._set_route_auth(result, index, resolution)
+        """Slim, Symfony-attribute and config-array routes (Laravel routes
+        are emitted after the walk, see ``_emit_laravel_routes``)."""
+        self._extract_slim_routes(content, relative, result, seen)
+        if "#[" in content:
+            self._extract_attribute_routes(content, relative, result, access_rules or [], route_config, seen)
 
         if not CONFIG_ROUTES_KEY_PATTERN.search(content):
             return
         for match in CONFIG_ROUTE_PATH_PATTERN.finditer(content):
-            self._append_unique_route(result, match.group(1), "ANY", relative, line_of(content, match.start()))
+            self._append_unique_route(
+                result, match.group(1), "ANY", relative, line_of(content, match.start()), seen=seen
+            )
+
+    def _extract_slim_routes(self, content: str, relative: str, result: ScanResult, seen: dict | None) -> None:
+        routers = set(SLIM_ROUTER_NAMES)
+        routers.update(SLIM_ROUTER_ASSIGN_PATTERN.findall(content))
+        routers.update(SLIM_ROUTER_PARAM_PATTERN.findall(content))
+        found: list[tuple[int, list[str], str]] = []
+        for match in SLIM_ROUTE_PATTERN.finditer(content):
+            if match.group(1) in routers:
+                method = match.group(2).upper()
+                found.append((match.start(), ["ANY" if method in ("MAP", "ANY") else method], match.group(3)))
+        for match in SLIM_MAP_PATTERN.finditer(content):
+            if match.group(1) in routers:
+                methods = list(dict.fromkeys(m.upper() for m in SLIM_MAP_METHOD_PATTERN.findall(match.group(2))))
+                if methods:
+                    found.append((match.start(), methods, match.group(3)))
+        if not found:
+            return
+        found.sort(key=lambda item: item[0])
+        groups = ra.slim_groups(content, routers) if "->group" in content else []
+        enclosing = ra.enclosing(groups, [offset for offset, _, _ in found])
+        for (offset, methods, path), outer in zip(found, enclosing):
+            if outer is None or any(group.prefix is None for group in outer):
+                full = "/" + lr.DYNAMIC_SEGMENT + path
+            else:
+                full = "".join(group.prefix for group in outer) + path
+            for method in methods:
+                index = self._append_unique_route(result, full, method, relative, line_of(content, offset), seen=seen)
+                if index is None or outer is None:
+                    continue
+                close = ra.matching_close(content, content.find("(", offset))
+                links = ra.parse_chain(content, close + 1) if close > 0 else []
+                self._set_route_auth(result, index, ra.resolve_slim(links, outer))
+
+    def _extract_attribute_routes(
+        self,
+        content: str,
+        relative: str,
+        result: ScanResult,
+        access_rules: list[ra.AccessRule],
+        route_config: sf.RouteConfig | None,
+        seen: dict | None,
+    ) -> None:
+        """Symfony ``#[Route]`` actions, joined onto their class's
+        ``#[Route]`` prefix and any route-config import prefix."""
+        blocks = ra.attribute_blocks(content)
+        routed = [(block, attrs) for block in blocks if (attrs := self._route_attrs(block))]
+        if not routed:
+            return
+        decl_ends = ra.class_decl_ends(content)
+        class_blocks = {block.target_offset: block for block in blocks if block.target == "class"}
+        import_prefixes = route_config.prefixes_for(relative) if route_config else [""]
+        # (offset, path, methods, block, owner class block)
+        found: list[tuple[int, str, list[str], ra.AttributeBlock, ra.AttributeBlock | None]] = []
+        prefixed_classes: set[int] = set()
+        for block, attrs in routed:
+            if block.target == "class":
+                continue
+            owner = None
+            class_attr = None
+            if block.target == "function":
+                owner = ra.owning_class(decl_ends, class_blocks, block.target_offset)
+                owner_attrs = self._route_attrs(owner) if owner is not None else []
+                if owner_attrs:
+                    prefixed_classes.add(owner.target_offset)
+                    class_attr = owner_attrs[0][1]
+            for offset, attr in attrs:
+                if attr.path is None:
+                    continue
+                if class_attr is None:
+                    path, methods = attr.path, attr.methods
+                else:
+                    prefix = class_attr.path if class_attr.path is not None else "/" + lr.DYNAMIC_SEGMENT
+                    path = sf.class_path(prefix, attr.path)
+                    methods = list(dict.fromkeys(class_attr.methods + attr.methods))
+                found.append((offset, path, methods, block, owner))
+        for block, attrs in routed:
+            # A class-level route is a route itself only for an invokable
+            # controller (no routed actions); otherwise it's the prefix.
+            if block.target == "class" and block.target_offset not in prefixed_classes:
+                found += [(offset, attr.path, attr.methods, block, None) for offset, attr in attrs if attr.path is not None]
+        found.sort(key=lambda item: item[0])
+        for offset, path, methods, block, owner in found:
+            line = line_of(content, offset)
+            # One route per live import (imports with different name
+            # prefixes all register it).
+            for import_prefix in import_prefixes:
+                full = sf.import_prefix(import_prefix, path)
+                # access_control is only matched against a fully known path.
+                rules = access_rules if lr.DYNAMIC_SEGMENT not in full else []
+                for method in methods or ["ANY"]:
+                    index = self._append_unique_route(result, full, method, relative, line, seen=seen)
+                    if index is not None:
+                        resolution = self._symfony_resolution(block, owner, full, method, rules)
+                        self._set_route_auth(result, index, resolution)
+
+    @staticmethod
+    def _route_attrs(block: ra.AttributeBlock) -> list[tuple[int, sf.RouteAttr]]:
+        return [(offset, attr) for offset, item in block.attributes if (attr := sf.route_attribute(item))]
 
     @staticmethod
     def _symfony_resolution(
-        block: ra.AttributeBlock | None,
-        decl_ends: list[int],
-        class_blocks: dict[int, ra.AttributeBlock],
+        block: ra.AttributeBlock,
+        owner: ra.AttributeBlock | None,
         path: str,
         method: str,
         access_rules: list[ra.AccessRule],
     ) -> ra.Resolution:
-        if block is None:
-            return ra.Resolution()
         states = [g for _, text in block.attributes if (g := ra.symfony_guard(text))]
-        prefixed = block.target == "class"
-        if block.target == "function":
-            owner = ra.owning_class(decl_ends, class_blocks, block.target_offset)
-            if owner is not None:
-                states += [g for _, text in owner.attributes if (g := ra.symfony_guard(text))]
-                prefixed = any(ATTRIBUTE_ROUTE_PATTERN.match("#[" + text + "]") for _, text in owner.attributes)
-        # access_control matches the full path; a class-level #[Route] prefix
-        # isn't joined onto method paths here, so skip it for those routes.
-        if access_rules and not prefixed:
+        if owner is not None:
+            states += [g for _, text in owner.attributes if (g := ra.symfony_guard(text))]
+        # access_control matches the full path (class and import prefixes
+        # joined); callers pass no rules when that path isn't certain.
+        if access_rules:
             rule = ra.resolve_access_control(access_rules, path, method)
             if rule is not None:
                 states.append(rule)
@@ -365,11 +546,17 @@ class PhpWebAnalyzer:
         auth: str = ra.UNKNOWN,
         guards: list[str] | None = None,
         guard_evidence: str | None = None,
+        seen: dict | None = None,
     ) -> int | None:
         """Append a route once per (path, method, file); return its index, or
-        None when it was already recorded."""
+        None when it was already recorded. ``seen`` indexes the keys already
+        in ``result.routes`` so a large repo isn't quadratic."""
         key = (path, method, file)
-        if any((item.path, item.method, item.file) == key for item in result.routes):
+        if seen is not None:
+            if key in seen:
+                return None
+            seen[key] = len(result.routes)
+        elif any((item.path, item.method, item.file) == key for item in result.routes):
             return None
         result.routes.append(
             Route(

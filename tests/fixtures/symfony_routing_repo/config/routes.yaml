@@ -1,0 +1,37 @@
+# Attribute routes under src/Controller/ are mounted under /app.
+controllers:
+    resource:
+        path: ../src/Controller/
+        namespace: App\Controller
+    type: attribute
+    prefix: /app
+
+homepage:
+    path: /
+    controller: Symfony\Bundle\FrameworkBundle\Controller\TemplateController::templateAction
+    defaults:
+        template: default/homepage.html.twig
+
+legacy_export:
+    path: '/legacy/export'
+    methods: [POST, PUT]
+    controller: App\Legacy\ExportController::export
+
+about:
+    path:
+        en: /about-us
+        nl: /over-ons
+    controller: App\Controller\PageController::about
+
+partner_api:
+    resource: partners.yaml
+    prefix: /partners
+
+when@dev:
+    dev_tools:
+        path: /_dev/tools
+        controller: App\Dev\ToolsController
+
+# The kernel only auto-loads config/routes/*.yaml; XML there is imported.
+legacy_xml:
+    resource: routes/legacy.xml

@@ -209,7 +209,7 @@ def test_slim_symfony_and_config_routes_are_extracted() -> None:
     result = PhpWebAnalyzer().analyze(FIXTURES / "slim_symfony_repo")
     keys = {(r.path, r.method) for r in result.routes}
     assert ("/status", "GET") in keys  # $api = AppFactory::create()
-    assert ("/tokens", "POST") in keys  # RouteCollectorProxy $v1 group param
+    assert ("/v1/tokens", "POST") in keys  # RouteCollectorProxy $v1 group param, '/v1' prefix
     assert ("/orders/{id}", "GET") in keys  # Symfony #[Route]
     assert ("/orders/{id}", "DELETE") in keys
     assert ("/api/ping", "ANY") in keys  # 'routes' => [['path' => ...]]
@@ -241,37 +241,38 @@ def _routes_by_key(fixture: str) -> dict:
 
 def test_laravel_guarded_routes_declare_required_auth() -> None:
     routes = _routes_by_key("route_auth_repo")
-    # Group guard (`Route::middleware([...])->group(...)`).
-    store = routes["POST /posts"]
+    # Group guard (`Route::middleware([...])->group(...)`); routes/api.php is
+    # mounted under /api.
+    store = routes["POST /api/posts"]
     assert store.auth == "required"
     assert store.guards == ["auth:sanctum"]
     assert "Route::middleware(['auth:sanctum'" in store.guard_evidence
-    assert routes["DELETE /posts/{id}"].auth == "required"
+    assert routes["DELETE /api/posts/{id}"].auth == "required"
     # Route-local `->middleware('auth')` with a `Controller@method` action.
-    assert routes["PATCH /settings"].auth == "required"
-    assert routes["PATCH /settings"].guard_evidence == "->middleware('auth')"
+    assert routes["PATCH /api/settings"].auth == "required"
+    assert routes["PATCH /api/settings"].guard_evidence == "->middleware('auth')"
     # Controller constructor `$this->middleware('auth')`.
-    assert routes["PUT /profile"].auth == "required"
-    assert routes["PUT /profile"].guards == ["auth"]
+    assert routes["PUT /api/profile"].auth == "required"
+    assert routes["PUT /api/profile"].guards == ["auth"]
 
 
 def test_laravel_route_level_opt_outs_are_anonymous() -> None:
     routes = _routes_by_key("route_auth_repo")
     # `->withoutMiddleware('auth:sanctum')` inside the auth group.
-    preview = routes["POST /posts/preview"]
+    preview = routes["POST /api/posts/preview"]
     assert preview.auth == "anonymous"
     assert preview.guards == []
     assert preview.guard_evidence == "->withoutMiddleware('auth:sanctum')"
     # Controller `->except(['show'])` opts the action out of the class guard.
-    assert routes["GET /profile/{id}"].auth == "anonymous"
-    assert "except(['show'])" in routes["GET /profile/{id}"].guard_evidence
+    assert routes["GET /api/profile/{id}"].auth == "anonymous"
+    assert "except(['show'])" in routes["GET /api/profile/{id}"].guard_evidence
 
 
 def test_slim_add_auth_middleware_on_route_or_group() -> None:
     routes = _routes_by_key("route_auth_repo")
     assert routes["POST /orders"].auth == "required"
     assert routes["POST /orders"].guards == ["$authMiddleware"]
-    invoices = routes["POST /invoices"]  # inside `$app->group(...)->add(new JwtAuthentication(...))`
+    invoices = routes["POST /billing/invoices"]  # inside `$app->group('/billing', ...)->add(new JwtAuthentication(...))`
     assert invoices.auth == "required"
     assert invoices.guards == ["JwtAuthentication"]
     # A non-auth middleware decides nothing.
@@ -297,9 +298,9 @@ def test_symfony_is_granted_and_access_control() -> None:
 
 def test_undetermined_routes_stay_unknown() -> None:
     routes = _routes_by_key("route_auth_repo")
-    assert routes["POST /contact"].auth == "unknown"
-    assert routes["POST /contact"].guards == []
-    assert routes["POST /contact"].guard_evidence is None
+    assert routes["POST /api/contact"].auth == "unknown"
+    assert routes["POST /api/contact"].guards == []
+    assert routes["POST /api/contact"].guard_evidence is None
     # The pre-existing fixture: one guarded route, one with no guard in sight.
     laravel = _routes_by_key("laravel_like_repo")
     assert laravel["GET /users/{id}"].auth == "required"

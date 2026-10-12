@@ -33,9 +33,14 @@ REQUIRED = "required"
 ANONYMOUS = "anonymous"
 UNKNOWN = "unknown"
 
+# Stands in for a path prefix that can't be read statically.
+DYNAMIC_SEGMENT = "{prefix}"
+
 _OPEN = "([{"
 _CLOSE = ")]}"
 _EVIDENCE_MAX = 200
+# Guard names reported per route (the evidence is clipped too).
+MAX_GUARDS = 16
 
 
 @dataclass
@@ -50,8 +55,10 @@ def clip(text: str) -> str:
     return text if len(text) <= _EVIDENCE_MAX else text[: _EVIDENCE_MAX - 1] + "…"
 
 
-# One token per step: a string opener, a comment opener or a bracket.
-_SCAN_TOKEN = re.compile(r"['\"]|//|/\*|#(?!\[)|[()\[\]{}]")
+# One token per step: a string opener, a heredoc/nowdoc opener, a comment
+# opener or a bracket.
+_SCAN_TOKEN = re.compile(r"['\"]|<<<|//|/\*|#(?!\[)|[()\[\]{}]")
+_HEREDOC_OPEN = re.compile(r"[ \t]*(['\"]?)([A-Za-z_]\w*)\1\r?\n")
 _STRING_BODY = {
     "'": re.compile(r"[^'\\]*(?:\\.[^'\\]*)*'", re.DOTALL),
     '"': re.compile(r'[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL),
@@ -62,8 +69,9 @@ _STRING_BODY = {
 def bracket_pairs(content: str) -> dict[int, int]:
     """Map each opening bracket's offset to its closing bracket's offset.
 
-    One forward pass over the file (strings and ``//`` / ``#`` / ``/* */``
-    comments skipped; ``#[`` is an attribute), so every later lookup is O(1)
+    One forward pass over the file (strings, heredocs/nowdocs and ``//`` /
+    ``#`` / ``/* */`` comments skipped; ``#[`` is an attribute), so every
+    later lookup is O(1)
     and a file full of unclosed brackets stays linear.
     """
     pairs: dict[int, int] = {}
@@ -79,6 +87,12 @@ def bracket_pairs(content: str) -> dict[int, int]:
         if token in _STRING_BODY:
             body = _STRING_BODY[token].match(content, pos)
             pos = body.end() if body else n
+        elif token == "<<<":
+            # Heredoc / nowdoc: skip to the closing identifier, which starts
+            # its own line (PHP 7.3+ allows indenting it).
+            opener = _HEREDOC_OPEN.match(content, pos)
+            if opener:
+                pos = _heredoc_end(content, opener.end(), opener.group(2))
         elif token == "//" or token == "#":
             nl = content.find("\n", pos)
             pos = n if nl < 0 else nl
@@ -90,6 +104,21 @@ def bracket_pairs(content: str) -> dict[int, int]:
         elif stack:
             pairs[stack.pop()] = match.start()
     return pairs
+
+
+def _heredoc_end(content: str, pos: int, label: str) -> int:
+    """Offset just past the line-leading ``label`` that closes a heredoc
+    opened before ``pos``, or the end of the file. One forward scan."""
+    n = len(content)
+    while pos < n:
+        nl = content.find("\n", pos)
+        line_end = n if nl < 0 else nl
+        stripped = content[pos:line_end].lstrip(" \t")
+        after = stripped[len(label) : len(label) + 1]
+        if stripped.startswith(label) and not (after.isalnum() or after == "_"):
+            return line_end - len(stripped) + len(label)
+        pos = line_end + 1
+    return n
 
 
 def matching_close(content: str, open_idx: int) -> int:
@@ -128,10 +157,31 @@ class Link:
         return clip(self.content[self.start : min(self.close + 1, self.start + 2 * _EVIDENCE_MAX)])
 
 
+_TRIVIA = re.compile(r"\s+|//[^\n]*|#(?!\[)[^\n]*|/\*")
+
+
+def skip_trivia(content: str, idx: int) -> int:
+    """Offset of the first character at or after ``idx`` that isn't
+    whitespace or a comment."""
+    while True:
+        match = _TRIVIA.match(content, idx)
+        if not match:
+            return idx
+        if match.group() == "/*":
+            end = content.find("*/", match.end())
+            if end < 0:
+                return len(content)
+            idx = end + 2
+        else:
+            idx = match.end()
+
+
 def parse_chain(content: str, idx: int) -> list[Link]:
-    """Method calls chained after ``idx`` (``->name(args)->name(args)...``)."""
+    """Method calls chained after ``idx`` (``->name(args)->name(args)...``),
+    with comments allowed between the links."""
     links: list[Link] = []
     while True:
+        idx = skip_trivia(content, idx)
         match = _CHAIN_LINK.match(content, idx)
         if not match:
             return links
@@ -171,7 +221,6 @@ _STRING_OR_CLASS = re.compile(r"['\"]([^'\"]*)['\"]|\\?([\w\\]+)::class")
 # middleware (`can:`) is left out: a policy can admit guests.
 _LARAVEL_AUTH_ALIASES = frozenset({"auth", "auth.basic", "auth.basic.once"})
 _LARAVEL_AUTH_CLASSES = frozenset({"Authenticate", "AuthenticateWithBasicAuth"})
-_LARAVEL_GROUP_START = re.compile(r"\bRoute::(\w+)\s*\(")
 _LARAVEL_GROUP_ATTR_MIDDLEWARE = re.compile(
     r"['\"](excluded_middleware|middleware)['\"]\s*=>\s*(\[[^\]]*\]|['\"][^'\"]*['\"])"
 )
@@ -214,37 +263,14 @@ class LaravelScope:
                 self.excluded += [(name, link.text) for name in laravel_auth_names(link.head())]
 
 
-@dataclass
-class LaravelGroup:
-    start: int
-    end: int
-    scope: LaravelScope
-
-
-def laravel_groups(content: str) -> list[LaravelGroup]:
-    groups: list[LaravelGroup] = []
-    for match in _LARAVEL_GROUP_START.finditer(content):
-        open_idx = match.end() - 1
-        close = matching_close(content, open_idx)
-        if close < 0:
-            continue
-        first = Link(match.group(1), content, match.start(), open_idx, close)
-        links = [first, *parse_chain(content, close + 1)]
-        group = next((link for link in links if link.name == "group"), None)
-        if group is None:
-            continue
-        scope = LaravelScope()
-        scope.add_links([link for link in links if link is not group])
-        # Legacy `Route::group(['middleware' => 'auth'], function () { ... })`.
-        for attr in _LARAVEL_GROUP_ATTR_MIDDLEWARE.finditer(group.head().split("function", 1)[0]):
-            names = laravel_auth_names(attr.group(2))
-            evidence = clip(attr.group(0))
-            target = scope.excluded if attr.group(1) == "excluded_middleware" else scope.applied
-            target += [(name, evidence) for name in names]
-        if scope.applied or scope.excluded:
-            # The group's span is its argument list; routes inside it inherit.
-            groups.append(LaravelGroup(group.open, group.close, scope))
-    return groups
+def add_group_attr_middleware(scope: LaravelScope, attrs: str) -> None:
+    """``'middleware' => ...`` / ``'excluded_middleware' => ...`` in a legacy
+    ``Route::group([...], fn)`` attribute array."""
+    for attr in _LARAVEL_GROUP_ATTR_MIDDLEWARE.finditer(attrs):
+        names = laravel_auth_names(attr.group(2))
+        evidence = clip(attr.group(0))
+        target = scope.excluded if attr.group(1) == "excluded_middleware" else scope.applied
+        target += [(name, evidence) for name in names]
 
 
 @dataclass
@@ -305,7 +331,7 @@ def laravel_action(content: str, open_idx: int, close: int) -> tuple[str, str] |
 
 def resolve_laravel(
     route_scope: LaravelScope,
-    groups: list[LaravelGroup],
+    groups: list,
     action: tuple[str, str] | None,
     controllers: dict[str, list[ControllerGuard]],
 ) -> Resolution:
@@ -327,7 +353,7 @@ def resolve_laravel(
     excluded_bases = {_base(name) for name, _ in excluded}
     remaining = [(name, ev) for name, ev in applied if _base(name) not in excluded_bases]
     if remaining:
-        guards = list(dict.fromkeys(name for name, _ in remaining))
+        guards = list(dict.fromkeys(name for name, _ in remaining))[:MAX_GUARDS]
         return Resolution(REQUIRED, guards, clip("; ".join(dict.fromkeys(ev for _, ev in remaining))))
     if excluded or controller_excepted:
         evidence = [ev for _, ev in excluded] + controller_excepted
@@ -361,11 +387,43 @@ class SlimGroup:
     start: int
     end: int
     guards: list[tuple[str, str]]
+    # Joined onto the routes inside: Slim's `$app->group('/v1', ...)`
+    # pattern, or Lumen's `$router->group(['prefix' => 'api'], ...)` as
+    # `/api`. None when it isn't a literal.
+    prefix: str | None = ""
+
+
+_SLIM_GROUP = re.compile(r"\$(\w+)\s*->\s*group\s*\(")
+_SLIM_GROUP_PATTERN = re.compile(r"\s*(?:'([^'\\]*)'|\"([^\"\\]*)\")\s*,")
+_SLIM_GROUP_CLOSURE = re.compile(r"\s*(?:static\s+)?(?:function|fn)\b")
+_LUMEN_GROUP_ATTRS = re.compile(r"\s*\[")
+_LUMEN_PREFIX = re.compile(r"['\"]prefix['\"]\s*=>\s*(?:'([^'\\]*)'|\"([^\"\\]*)\")?")
+
+
+def _slim_group_prefix(content: str, open_idx: int, close: int) -> str | None:
+    pattern = _SLIM_GROUP_PATTERN.match(content, open_idx + 1, close)
+    if pattern:
+        return pattern.group(1) if pattern.group(1) is not None else pattern.group(2)
+    attrs = _LUMEN_GROUP_ATTRS.match(content, open_idx + 1, close)
+    if attrs:
+        attrs_close = matching_close(content, attrs.end() - 1)
+        if attrs_close < 0:
+            return None
+        prefix = _LUMEN_PREFIX.search(content, attrs.end(), min(attrs_close, attrs.end() + _ARG_SCAN))
+        if prefix is None:
+            return ""
+        value = prefix.group(1) if prefix.group(1) is not None else prefix.group(2)
+        if value is None:
+            return None
+        return "/" + value.strip("/") if value.strip("/") else ""
+    if _SLIM_GROUP_CLOSURE.match(content, open_idx + 1, close):
+        return ""
+    return None
 
 
 def slim_groups(content: str, routers: set[str]) -> list[SlimGroup]:
     groups = []
-    for match in re.finditer(r"\$(\w+)\s*->\s*group\s*\(", content):
+    for match in _SLIM_GROUP.finditer(content):
         if match.group(1) not in routers:
             continue
         open_idx = match.end() - 1
@@ -373,8 +431,9 @@ def slim_groups(content: str, routers: set[str]) -> list[SlimGroup]:
         if close < 0:
             continue
         guards = slim_auth_adds(parse_chain(content, close + 1))
-        if guards:
-            groups.append(SlimGroup(open_idx, close, guards))
+        prefix = _slim_group_prefix(content, open_idx, close)
+        if guards or prefix != "":
+            groups.append(SlimGroup(open_idx, close, guards, prefix))
     return groups
 
 
@@ -383,7 +442,7 @@ def resolve_slim(route_links: list[Link], groups: list[SlimGroup]) -> Resolution
     for group in groups:
         guards += group.guards
     if guards:
-        names = list(dict.fromkeys(name for name, _ in guards))
+        names = list(dict.fromkeys(name for name, _ in guards))[:MAX_GUARDS]
         return Resolution(REQUIRED, names, clip("; ".join(dict.fromkeys(ev for _, ev in guards))))
     return Resolution()
 
@@ -398,6 +457,35 @@ _ATTR_TARGET = re.compile(
 _PUBLIC_ROLES = frozenset({"PUBLIC_ACCESS", "IS_AUTHENTICATED_ANONYMOUSLY"})
 _GUARD_ATTR = re.compile(r"\s*\\?(?:[\w\\]+\\)?(IsGranted|Security)\s*\(")
 _FIRST_STRING = re.compile(r"['\"]([^'\"]*)['\"]")
+
+
+# Attribute groups longer than this are read only this far.
+_ATTR_GROUP_SCAN = 8000
+
+
+def split_attribute_group(content: str, start: int, end: int) -> list[str]:
+    """The comma-separated attributes in ``content[start:end]`` (the inside
+    of one ``#[...]``), split at top-level commas via the bracket table."""
+    pairs = bracket_pairs(content)
+    items: list[str] = []
+    end = min(end, start + _ATTR_GROUP_SCAN)
+    item_start = pos = start
+    while pos < end:
+        ch = content[pos]
+        if ch in _OPEN:
+            close = pairs.get(pos, -1)
+            pos = close + 1 if close > pos else pos + 1
+            continue
+        if ch in _STRING_BODY:
+            body = _STRING_BODY[ch].match(content, pos + 1, end)
+            pos = body.end() if body else end
+            continue
+        if ch == ",":
+            items.append(content[item_start:pos].strip())
+            item_start = pos + 1
+        pos += 1
+    items.append(content[item_start:end].strip())
+    return [item for item in items if item]
 
 
 @dataclass
@@ -418,8 +506,11 @@ def attribute_blocks(content: str) -> list[AttributeBlock]:
             break
         close = matching_close(content, match.start() + 1)
         if close < 0:
-            break
-        current.append((match.start(), content[match.start() + 2 : close]))
+            # A `#[` in a comment or string (the bracket scan skipped it).
+            pos = match.end()
+            continue
+        # `#[Route('/x'), IsGranted('ROLE_USER')]` holds several attributes.
+        current += [(match.start(), item) for item in split_attribute_group(content, match.start() + 2, close)]
         pos = close + 1
         if content.startswith("#[", _WS.match(content, pos).end()):
             continue
@@ -569,7 +660,7 @@ def combine(states: list[tuple[str, str, str]]) -> Resolution:
     required; explicitly public only when nothing requires auth."""
     required = [(guard, ev) for state, guard, ev in states if state == REQUIRED]
     if required:
-        guards = list(dict.fromkeys(guard for guard, _ in required))
+        guards = list(dict.fromkeys(guard for guard, _ in required))[:MAX_GUARDS]
         return Resolution(REQUIRED, guards, clip("; ".join(dict.fromkeys(ev for _, ev in required))))
     anonymous = list(dict.fromkeys(ev for state, _, ev in states if state == ANONYMOUS))
     if anonymous:

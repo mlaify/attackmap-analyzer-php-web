@@ -1,0 +1,7 @@
+{
+    "name": "example/symfony-routing",
+    "require": {
+        "symfony/framework-bundle": "^7.1",
+        "symfony/security-bundle": "^7.1"
+    }
+}
