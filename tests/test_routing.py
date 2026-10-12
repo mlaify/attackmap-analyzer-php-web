@@ -398,6 +398,65 @@ def test_public_file_keeps_root_chain_when_its_root_loader_is_in_a_once_cycle(tm
     assert (routes["GET /status"].auth, routes["GET /admin/status"].auth) == ("unknown", "required")
 
 
+@pytest.mark.parametrize("bootstrap", [False, True])
+@pytest.mark.parametrize("wrapper", ["web", "admin"])
+def test_mutual_require_once_with_an_auth_group(tmp_path: Path, wrapper: str, bootstrap: bool) -> None:
+    # routes/web.php is loaded by the framework first, so admin.php's
+    # `require_once` of it is a no-op whichever file wraps its include in
+    # an auth group.
+    wrap = "Route::middleware('auth')->group(function () {{\n    require_once base_path('routes/{}.php');\n}});\n"
+    plain = "require_once base_path('routes/{}.php');\n"
+    files = {
+        "routes/web.php": "<?php\n" + (wrap if wrapper == "web" else plain).format("admin") + "Route::get('/home', fn () => 1);\n",
+        "routes/admin.php": "<?php\n" + (wrap if wrapper == "admin" else plain).format("web") + "Route::get('/admin', fn () => 1);\n",
+    }
+    if bootstrap:
+        files["bootstrap/app.php"] = "<?php\n->withRouting(web: __DIR__.'/../routes/web.php');\n"
+    _write(tmp_path, files)
+    routes = _routes(tmp_path)
+    assert set(routes) == {"GET /home", "GET /admin"}
+    assert routes["GET /home"].auth == "unknown"
+    assert routes["GET /admin"].auth == ("required" if wrapper == "web" else "unknown")
+
+
+def test_with_routing_web_target_is_a_framework_root(tmp_path: Path) -> None:
+    # A non-default web file named in withRouting(web: ...) is loaded first,
+    # so admin.php's grouped `require_once` of it is a no-op.
+    _write(
+        tmp_path,
+        {
+            "bootstrap/app.php": "<?php\n->withRouting(web: __DIR__.'/../routes/site.php');\n",
+            "routes/site.php": "<?php\nrequire_once base_path('routes/admin.php');\nRoute::get('/home', fn () => 1);\n",
+            "routes/admin.php": (
+                "<?php\nRoute::middleware('auth')->group(function () {\n"
+                "    require_once base_path('routes/site.php');\n});\nRoute::get('/admin', fn () => 1);\n"
+            ),
+        },
+    )
+    routes = _routes(tmp_path)
+    assert (routes["GET /home"].auth, routes["GET /admin"].auth) == ("unknown", "unknown")
+
+
+def test_unseen_root_in_a_require_once_cycle_keeps_its_root_chain(tmp_path: Path) -> None:
+    # main.php is loaded by something we can't see as a mount; legacy.php's
+    # `require_once` of it is a no-op, so main.php is a root.
+    _write(
+        tmp_path,
+        {
+            "routes/main.php": (
+                "<?php\nrequire base_path('routes/legacy.php');\nrequire base_path('routes/public.php');\n"
+                "Route::middleware('auth')->prefix('admin')->group(function () {\n"
+                "    require base_path('routes/public.php');\n});\n"
+            ),
+            "routes/legacy.php": "<?php\nrequire_once base_path('routes/main.php');\n",
+            "routes/public.php": "<?php\nRoute::get('/status', fn () => 1);\n",
+        },
+    )
+    routes = _routes(tmp_path)
+    assert set(routes) == {"GET /status", "GET /admin/status"}
+    assert routes["GET /status"].auth == "unknown"
+
+
 def test_test_files_do_not_mount_route_files(tmp_path: Path) -> None:
     _write(
         tmp_path,

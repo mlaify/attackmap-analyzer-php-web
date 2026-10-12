@@ -237,7 +237,14 @@ class PhpWebAnalyzer:
         for relative, (_, scan) in scans.items():
             for mount in scan.mounts:
                 sites.setdefault(mount.target, []).append((relative, mount.groups, mount.once))
-        resolver = lr.MountResolver(sites, (lr.LITERAL, "api"))
+        # Framework-loaded route files: the default routes/web.php and
+        # routes/api.php, and anything mounted from outside routes/
+        # (bootstrap/app.php `withRouting`, a RouteServiceProvider).
+        framework_roots = set(lr.FRAMEWORK_ROUTE_FILES)
+        for target, target_sites in sites.items():
+            if any(not source.startswith("routes/") for source, _, _ in target_sites):
+                framework_roots.add(target)
+        resolver = lr.MountResolver(sites, (lr.LITERAL, "api"), frozenset(framework_roots))
         config_cache: dict[str, str | None] = {}
         for relative, (content, scan) in scans.items():
             if not scan.routes:

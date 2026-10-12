@@ -91,6 +91,8 @@ MAX_RESOURCES = 64
 # distinct mount chains per file.
 MAX_MOUNT_DEPTH = 8
 MAX_MOUNT_CHAINS = 8
+# Route files Laravel's default bootstrap loads itself.
+FRAMEWORK_ROUTE_FILES = frozenset({"routes/web.php", "routes/api.php"})
 # Mount edges followed per repo before the rest stay unresolved, and the
 # recursion depth of one resolution.
 MAX_MOUNT_VISITS = 4096
@@ -113,7 +115,7 @@ _MOUNT_REF = re.compile(
 )
 # What precedes a mount reference: the file is loaded, not just named.
 _MOUNT_LEAD = re.compile(
-    r"(?:\b(?:require|include)(?:_once)?\s*\(?|\bloadRoutesFrom\s*\(|->\s*group\s*\(|\bapi\s*:\s*\[?)\s*$"
+    r"(?:\b(?:require|include)(?:_once)?\s*\(?|\bloadRoutesFrom\s*\(|->\s*group\s*\(|\b(?:api|web)\s*:\s*\[?)\s*$"
 )
 _ONCE_LEAD = re.compile(r"\b(?:require|include)_once\s*\(?\s*$")
 # Mounts in test code (a test that requires routes/api.php) don't count.
@@ -611,9 +613,18 @@ class MountResolver:
     """
 
     def __init__(
-        self, sites: dict[str, list[tuple[str, list[LaravelGroup] | None, bool]]], default_api: Prefix
+        self,
+        sites: dict[str, list[tuple[str, list[LaravelGroup] | None, bool]]],
+        default_api: Prefix,
+        framework_roots: frozenset[str] = frozenset(),
     ) -> None:
-        self.sites = sites
+        # The framework loads these before any route file runs, so a
+        # `require_once` of one from a route file is a no-op.
+        self.framework_roots = framework_roots
+        self.sites = {
+            target: [site for site in target_sites if not (site[2] and target in framework_roots)]
+            for target, target_sites in sites.items()
+        }
         self.default_api = default_api
         self._memo: dict[str, tuple[list[list[LaravelGroup] | None], int]] = {}
         self._path: list[str] = []  # files being resolved, outermost first
@@ -669,12 +680,12 @@ class MountResolver:
                 if len(out) >= MAX_MOUNT_CHAINS:
                     break
         self._path.pop()
-        if not out and not exhausted and all(once for _, _, once in sites):
-            # Every loader is a `require_once` that yields nothing (a no-op
-            # re-include): the file was loaded first by something we don't
-            # see as a mount (the framework, `withRouting(web: ...)`), so
-            # it is a root. A plain `require` that only closes a cycle
-            # still contributes nothing.
+        if not out and not exhausted and all(once and groups == [] for _, groups, once in sites):
+            # Every loader is an un-grouped `require_once` that yields
+            # nothing (a no-op re-include): the file was loaded first by
+            # something we don't see as a mount, so it is a root. A plain
+            # `require` that only closes a cycle, or a loader that wraps
+            # the include in a group, still contributes nothing.
             out = [[]]
         if height > MAX_MOUNT_DEPTH:
             out = [None]  # mounted deeper than we follow
