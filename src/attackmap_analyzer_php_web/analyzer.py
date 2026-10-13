@@ -4,21 +4,25 @@ import json
 import re
 from pathlib import Path
 
-from attackmap.sdk import iter_repo_files, line_of, line_snippet, read_source, rel
-
-from . import laravel_routes as lr
-from . import route_auth as ra
-from . import symfony_routes as sf
-from .contracts import (
+from attackmap.sdk import (
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
     ExternalCall,
     FrameworkHint,
+    iter_repo_files,
+    line_of,
+    line_snippet,
+    read_source,
+    rel,
     Route,
     ScanResult,
     SecretHint,
 )
+
+from . import laravel_routes as lr
+from . import route_auth as ra
+from . import symfony_routes as sf
 
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
 
