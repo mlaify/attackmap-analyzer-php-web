@@ -52,6 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **License metadata uses an SPDX expression (PEP 639).** `license = "MIT"` and `license-files = ["LICENSE"]` replace the deprecated `license = {text = "MIT"}` table, and the `License ::` classifier (which setuptools ≥ 77 rejects next to an expression) is gone. The build backend floor is now `setuptools>=77` (mlaify/AttackMap#259).
+- **Removed the committed `build/lib/` copy of the package.** It was stale (its `detect()` differed from `src/`) and `build/` is already in `.gitignore` (mlaify/AttackMap#259).
 - Skip list is now the SDK's `DEFAULT_SKIP_DIRS` (was `vendor`, `.git`, `node_modules`; adds `build`, `dist`, `out`, `target`, virtualenvs and caches).
 - Signal `file` paths are always POSIX-style (`src/routes.php`), including on Windows.
 - Requires an AttackMap core that ships `attackmap.sdk.fs`.
