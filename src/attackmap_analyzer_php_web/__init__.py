@@ -1,4 +1,4 @@
 from .analyzer import PhpWebAnalyzer
-from .contracts import AnalyzerMetadata
+from attackmap.sdk import AnalyzerMetadata
 
 __all__ = ["AnalyzerMetadata", "PhpWebAnalyzer"]
