@@ -89,11 +89,16 @@ AUTH_PATTERNS = [
     (re.compile(r"\$_SESSION\b", re.IGNORECASE), "session"),
     (re.compile(r"\bpassword_hash\s*\(", re.IGNORECASE), "password_hash"),
     (re.compile(r"\bpassword_verify\s*\(", re.IGNORECASE), "password_verify"),
-    # A JWT library, not any "jwt" substring (`$jwtSecret`, comments).
+    # JWT verification only (AttackMap#325): core credits any auth hint near a
+    # route as that route's auth, so `use` imports, `JWT::encode` and building
+    # tokens don't count. firebase/php-jwt `JWT::decode` always verifies; tymon
+    # facade checks and `jwt.auth` middleware; lcobucci validator / SignedWith;
+    # Tuupola JwtAuthentication middleware.
     (
         re.compile(
-            r"Firebase\\JWT\\JWT|\bJWT::(?:decode|encode)\b|Lcobucci\\JWT|lcobucci/jwt"
-            r"|Tymon\\JWTAuth|tymon/jwt-auth|\bJWTAuth::"
+            r"\bJWT::decode\s*\(|\bJWTAuth::(?:parseToken|authenticate|toUser|getPayload|check)\b"
+            r"|['\"]jwt\.(?:auth|verify)['\"]|\bvalidator\s*\(\s*\)\s*->\s*(?:validate|assert)\s*\("
+            r"|\bnew\s+SignedWith\s*\(|\bJwtAuthentication\b"
         ),
         "jwt",
     ),
@@ -356,7 +361,11 @@ class PhpWebAnalyzer:
                     result.framework_hints, FrameworkHint, "http_client", "composer.json", text, offset, 0.9
                 )
             if "firebase/php-jwt" in lower:
-                self._append_unique_hint(result.auth_hints, AuthHint, "jwt", "composer.json", text, offset)
+                # A JWT library is a capability, not a check (#13): only
+                # verifying calls in code become `jwt` auth hints.
+                self._append_unique_hint(
+                    result.framework_hints, FrameworkHint, "jwt_library", "composer.json", text, offset, 0.9
+                )
 
     def _extract_routes(
         self,
