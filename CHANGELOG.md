@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — JWT auth hints need verification (#13, AttackMap#325)
+
+- The `jwt` auth hint used to match imports (`use Firebase\JWT\JWT;`, `Lcobucci\JWT`, `Tymon\JWTAuth`), `JWT::encode` and any `JWTAuth::` call. It now needs verification:
+  - firebase/php-jwt `JWT::decode(`, which always checks the signature;
+  - tymon `JWTAuth::parseToken|authenticate|toUser|getPayload|check`, or `'jwt.auth'` / `'jwt.verify'` middleware;
+  - lcobucci `validator()->validate(` / `->assert(` or `new SignedWith(`;
+  - Tuupola `JwtAuthentication`.
+- Core credits any auth hint near a route as that route's auth, so files that only built or signed tokens made their routes look protected.
+- `firebase/php-jwt` in composer.json is now a `jwt_library` framework hint, not a `jwt` auth hint on composer.json.
+- On pterodactyl/panel@90b2aa8 (`-m php-web`): the three app files that only build or sign lcobucci tokens (`NodeJWTService.php`, `DaemonTransferRepository.php`, `TimestampDates.php`) no longer get a `jwt` hint. The two integration tests that verify with `new SignedWith(` keep it, on that line instead of the import. Routes, findings and surface risk are unchanged.
+
 ### Added — Laravel and Symfony route paths (#3)
 
 - **Laravel resources and `match`.** `Route::resource` / `apiResource` (and `Route::resources([...])` / `apiResources`) expand to their REST routes, so `Route::resource('photos', ...)` yields `DELETE /photos/{photo}` and the rest. `->only()` / `->except()` / `->shallow()`, an `['only' => ...]` options array and nested `photos.comments` names are honoured, and each action is matched to the controller's constructor middleware. Array-first `Route::match(['get', 'post'], '/x')` and Slim `$app->map(['GET'], '/x')` now produce one route per method.

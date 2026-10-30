@@ -98,18 +98,19 @@ def test_analyze_extracts_datastore_auth_and_secret_hints() -> None:
 def test_http_client_dependency_is_a_framework_hint_not_auth(tmp_path: Path) -> None:
     # Guzzle in composer.json used to be emitted as the AuthHint `http_client`
     # (AttackMap#258). It is a library capability: a FrameworkHint citing the
-    # composer.json line. firebase/php-jwt stays a genuine auth signal.
+    # composer.json line. firebase/php-jwt is one too (#13): a library, not a
+    # check, so it no longer marks composer.json as authenticated.
     (tmp_path / "composer.json").write_text(
         '{\n  "require": {\n    "guzzlehttp/guzzle": "^7.8",\n    "firebase/php-jwt": "^6.0"\n  }\n}\n'
     )
     result = PhpWebAnalyzer().analyze(tmp_path)
 
-    assert [h.hint for h in result.auth_hints] == ["jwt"]
-    jwt = result.auth_hints[0]
-    assert (jwt.file, jwt.line, jwt.evidence_text) == ("composer.json", 4, '"firebase/php-jwt": "^6.0"')
-    assert [h.hint for h in result.framework_hints] == ["http_client"]
-    client = result.framework_hints[0]
+    assert result.auth_hints == []
+    by_hint = {h.hint: h for h in result.framework_hints}
+    assert set(by_hint) == {"http_client", "jwt_library"}
+    client, jwt = by_hint["http_client"], by_hint["jwt_library"]
     assert (client.file, client.line, client.evidence_text) == ("composer.json", 3, '"guzzlehttp/guzzle": "^7.8",')
+    assert (jwt.file, jwt.line, jwt.evidence_text) == ("composer.json", 4, '"firebase/php-jwt": "^6.0"')
 
 
 def test_auth_hints_cite_the_matching_line() -> None:
@@ -202,7 +203,8 @@ def test_jwt_substring_and_auth_method_are_not_auth_hints() -> None:
 
 def test_firebase_jwt_usage_is_a_jwt_hint() -> None:
     result = PhpWebAnalyzer().analyze(FIXTURES / "slim_symfony_repo")
-    assert ("jwt", "src/app.php") in {(h.hint, h.file) for h in result.auth_hints}
+    # On the JWT::decode line, not the `use Firebase\JWT\JWT;` import (#13).
+    assert ("jwt", "src/app.php", 16) in {(h.hint, h.file, h.line) for h in result.auth_hints}
 
 
 def test_slim_symfony_and_config_routes_are_extracted() -> None:
@@ -342,3 +344,35 @@ def test_class_guard_does_not_leak_into_a_later_unattributed_class(tmp_path: Pat
     routes = {r.path: r for r in PhpWebAnalyzer().analyze(tmp_path).routes}
     assert routes["/admin/purge"].auth == "required"
     assert routes["/comments"].auth == "unknown"
+
+NON_VERIFYING_JWT = [
+    "<?php\nuse Firebase\\JWT\\JWT;\nuse Lcobucci\\JWT\\Configuration;\n",
+    "<?php\n// TODO: verify the JWT\n$x = 1;\n",
+    "<?php\n$t = JWT::encode($payload, $key, 'HS256');\n",
+    "<?php\n$t = $config->builder()->issuedBy('x')->getToken($config->signer(), $config->signingKey());\n",
+    "<?php\n$t = JWTAuth::fromUser($user);\n",
+    "<?php\n$token = $config->parser()->parse($raw);\n",
+]
+
+VERIFYING_JWT = [
+    "$c = JWT::decode($raw, new Key($k, 'HS256'));",
+    "$user = JWTAuth::parseToken()->authenticate();",
+    "Route::middleware('jwt.auth')->get('/me', fn () => 1);",
+    "if (!$config->validator()->validate($token, ...$config->validationConstraints())) { exit; }",
+    "$validator->assert($token, new SignedWith($signer, $key));",
+    "$app->add(new Tuupola\\Middleware\\JwtAuthentication(['secret' => $s]));",
+]
+
+
+@pytest.mark.parametrize("body", NON_VERIFYING_JWT)
+def test_jwt_hint_needs_verification(tmp_path: Path, body: str) -> None:
+    (tmp_path / "auth.php").write_text(body, encoding="utf-8")
+    result = PhpWebAnalyzer().analyze(tmp_path)
+    assert not any(h.hint == "jwt" for h in result.auth_hints)
+
+
+@pytest.mark.parametrize("line", VERIFYING_JWT)
+def test_jwt_hint_from_verification(tmp_path: Path, line: str) -> None:
+    (tmp_path / "auth.php").write_text("<?php\n" + line + "\n", encoding="utf-8")
+    hints = [h for h in PhpWebAnalyzer().analyze(tmp_path).auth_hints if h.hint == "jwt"]
+    assert [h.line for h in hints] == [2]
