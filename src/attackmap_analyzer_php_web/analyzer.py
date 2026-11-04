@@ -123,7 +123,7 @@ class PhpWebAnalyzer:
     metadata = AnalyzerMetadata(
         name="php-web",
         display_name="PHP Web Analyzer",
-        version="0.1.0",
+        version="0.2.0",
         description="Broad PHP web analyzer that emits structured security-relevant scan signals.",
         scope="Generic PHP web projects using route declarations, web controllers, and common HTTP/database/auth patterns.",
         targets=["php-web"],

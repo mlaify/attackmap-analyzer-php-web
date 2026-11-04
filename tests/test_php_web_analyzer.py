@@ -23,7 +23,7 @@ def test_metadata_contains_required_fields() -> None:
 
     assert metadata.name == "php-web"
     assert metadata.display_name == "PHP Web Analyzer"
-    assert metadata.version == "0.1.0"
+    assert metadata.version == "0.2.0"
     assert metadata.description
     assert metadata.scope
     assert metadata.targets
