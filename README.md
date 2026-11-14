@@ -78,8 +78,8 @@ Datastore/auth/secret hints are similarly heuristic and intended as first-pass s
 ## Installation
 
 ```bash
-uv tool install attackmap --with attackmap-analyzer-php-web \
-  --index mlaify=https://pkg.mlaify.io/pypi/simple/ --index-strategy first-index
+uv tool install attackmap --with attackmap-analyzer-php-web    # from PyPI
+# or: pip install attackmap-analyzer-php-web    (installs attackmap too)
 # or from source:
 pip install git+https://github.com/mlaify/attackmap-analyzer-php-web.git
 ```
