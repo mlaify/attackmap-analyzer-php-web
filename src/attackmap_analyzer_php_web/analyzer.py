@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from attackmap.sdk import (
+    plugin_version,
     AnalyzerMetadata,
     AuthHint,
     DatabaseHint,
@@ -123,7 +124,8 @@ class PhpWebAnalyzer:
     metadata = AnalyzerMetadata(
         name="php-web",
         display_name="PHP Web Analyzer",
-        version="0.2.1",
+        version=plugin_version("attackmap-analyzer-php-web", default="0.2.1"),
+        requires_core=">=0.8,<2",
         description="Broad PHP web analyzer that emits structured security-relevant scan signals.",
         scope="Generic PHP web projects using route declarations, web controllers, and common HTTP/database/auth patterns.",
         targets=["php-web"],
